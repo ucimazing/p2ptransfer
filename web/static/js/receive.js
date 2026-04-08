@@ -1,5 +1,6 @@
 /**
  * Receiver page logic.
+ * Works with multi-connection TransferEngine.
  * ROOM_ID is injected by the template.
  */
 (function () {
@@ -11,7 +12,7 @@
   const btnStartDownload = document.getElementById('btn-start-download');
 
   let engine = null;
-  let receiveStarted = false; // Guard against double-start
+  let receiveStarted = false;
 
   // --- Interstitial countdown ---
   let countdown = 5;
@@ -22,12 +23,10 @@
       clearInterval(timer);
       countdownEl.textContent = '0';
       btnStartDownload.classList.remove('hidden');
-      // Auto-start after countdown
       if (!receiveStarted) startReceive();
     }
   }, 1000);
 
-  // Manual start button (backup)
   btnStartDownload.addEventListener('click', () => {
     clearInterval(timer);
     if (!receiveStarted) startReceive();
@@ -38,7 +37,6 @@
     stepInterstitial.classList.add('hidden');
     stepConnecting.classList.remove('hidden');
 
-    // Connect WebSocket as receiver
     const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     const wsUrl = `${wsProto}//${location.host}/ws?room=${ROOM_ID}&role=receiver`;
     const signaling = new SignalingClient(wsUrl);
@@ -46,15 +44,22 @@
     signaling.waitOpen().then(() => {
       engine = new TransferEngine('receiver', signaling);
 
-      // Handle signaling
-      signaling.on('offer', (offer) => {
-        stepConnecting.classList.add('hidden');
-        stepTransfer.classList.remove('hidden');
-        engine.handleOffer(offer);
+      let firstOfferReceived = false;
+
+      // Multiple offers arrive (one per connection) — handle each
+      signaling.on('offer', (payload) => {
+        // Show transfer UI on first offer
+        if (!firstOfferReceived) {
+          firstOfferReceived = true;
+          stepConnecting.classList.add('hidden');
+          stepTransfer.classList.remove('hidden');
+        }
+        engine.handleOffer(payload);
       });
 
-      signaling.on('ice-candidate', (candidate) => {
-        engine.addIceCandidate(candidate);
+      // ICE payloads include { index, candidate }
+      signaling.on('ice-candidate', (payload) => {
+        engine.addIceCandidate(payload);
       });
 
       signaling.on('peer-disconnected', () => {

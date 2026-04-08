@@ -1,5 +1,6 @@
 /**
  * Sender page logic.
+ * Works with multi-connection TransferEngine.
  */
 (function () {
   const dropZone = document.getElementById('drop-zone');
@@ -84,7 +85,6 @@
         statusBadge.className = 'status status-connected';
         statusText.textContent = 'Receiver connected! Starting transfer...';
 
-        // Small delay then start transfer
         setTimeout(() => {
           stepShare.classList.add('hidden');
           stepTransfer.classList.remove('hidden');
@@ -96,12 +96,14 @@
         }, 800);
       });
 
-      signaling.on('answer', (answer) => {
-        engine.handleAnswer(answer);
+      // Answer payloads now include { index, type, sdp }
+      signaling.on('answer', (payload) => {
+        engine.handleAnswer(payload);
       });
 
-      signaling.on('ice-candidate', (candidate) => {
-        engine.addIceCandidate(candidate);
+      // ICE payloads now include { index, candidate }
+      signaling.on('ice-candidate', (payload) => {
+        engine.addIceCandidate(payload);
       });
 
       signaling.on('peer-disconnected', () => {
