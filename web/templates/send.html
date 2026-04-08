@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Send File — FastTransfer | Free P2P File Sharing</title>
+  <meta name="description" content="Send files of any size instantly. No upload to a server — files transfer directly to the receiver at maximum speed using peer-to-peer technology.">
+  <meta name="robots" content="index, follow">
+  <link rel="canonical" href="https://fasttransfer.io/send">
+
+  <meta property="og:title" content="Send a File — FastTransfer">
+  <meta property="og:description" content="Send files directly to anyone. No size limit, no sign-up, blazing fast P2P transfer.">
+  <meta property="og:url" content="https://fasttransfer.io/send">
+
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/css/style.css">
+
+  <!-- Google AdSense -->
+  <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-XXXXXXXXXXXXXXXX" crossorigin="anonymous"></script>
+</head>
+<body>
+  <nav class="nav">
+    <a href="/" class="nav-brand">Fast<span>Transfer</span></a>
+    <div class="nav-links">
+      <a href="/send">Send File</a>
+    </div>
+  </nav>
+
+  <div class="container">
+    <!-- Step 1: Select file -->
+    <div id="step-select" class="card">
+      <div class="card-title">Step 1 — Select File</div>
+      <div class="drop-zone" id="drop-zone">
+        <input type="file" id="file-input">
+        <div class="drop-zone-icon">&#128448;</div>
+        <div class="drop-zone-text">Drop a file here or click to browse</div>
+        <div class="drop-zone-hint">Any file type, any size</div>
+      </div>
+      <div id="file-info" class="file-info hidden">
+        <div class="file-icon">&#128196;</div>
+        <div class="file-details">
+          <div class="file-name" id="file-name"></div>
+          <div class="file-size" id="file-size"></div>
+        </div>
+        <button class="btn btn-primary" id="btn-send">Create Link</button>
+      </div>
+    </div>
+
+    <!-- Step 2: Share link -->
+    <div id="step-share" class="card hidden">
+      <div class="card-title">Step 2 — Share This Link</div>
+      <p style="color: var(--text-dim); font-size: 14px; margin-bottom: 12px;">
+        Send this link to the receiver. Keep this tab open — the transfer happens directly from your browser.
+      </p>
+      <div class="share-link">
+        <input type="text" id="share-url" readonly>
+        <button class="btn btn-outline" id="btn-copy">Copy</button>
+      </div>
+      <div style="margin-top: 16px;">
+        <span class="status status-waiting" id="status-badge">
+          <span class="status-dot"></span>
+          <span id="status-text">Waiting for receiver...</span>
+        </span>
+      </div>
+    </div>
+
+    <!-- AdSense: In-page ad between steps -->
+    <div id="ad-mid" class="hidden" style="text-align:center; margin: 16px 0;">
+      <ins class="adsbygoogle"
+           style="display:block"
+           data-ad-client="ca-pub-XXXXXXXXXXXXXXXX"
+           data-ad-slot="XXXXXXXXXX"
+           data-ad-format="auto"
+           data-full-width-responsive="true"></ins>
+      <script>(adsbygoogle = window.adsbygoogle || []).push({});</script>
+    </div>
+
+    <!-- Step 3: Transfer progress -->
+    <div id="step-transfer" class="card hidden">
+      <div class="card-title">Sending File</div>
+      <div class="file-info">
+        <div class="file-icon">&#128196;</div>
+        <div class="file-details">
+          <div class="file-name" id="t-file-name"></div>
+          <div class="file-size" id="t-file-size"></div>
+        </div>
+        <span class="status status-transferring">
+          <span class="status-dot"></span>
+          Transferring
+        </span>
+      </div>
+      <div class="progress-container">
+        <div class="progress-bar-wrap">
+          <div class="progress-bar" id="progress-bar"></div>
+        </div>
+      </div>
+      <div class="stats">
+        <div class="stat">
+          <div class="stat-value" id="stat-speed">--</div>
+          <div class="stat-label">Speed</div>
+        </div>
+        <div class="stat">
+          <div class="stat-value" id="stat-progress">0%</div>
+          <div class="stat-label">Progress</div>
+        </div>
+        <div class="stat">
+          <div class="stat-value" id="stat-transferred">0 B</div>
+          <div class="stat-label">Sent</div>
+        </div>
+        <div class="stat">
+          <div class="stat-value" id="stat-eta">--:--</div>
+          <div class="stat-label">ETA</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Step 4: Complete -->
+    <div id="step-complete" class="card hidden">
+      <div class="complete-card">
+        <div class="complete-icon">&#10003;</div>
+        <h2>Transfer Complete</h2>
+        <p style="color: var(--text-dim); margin: 8px 0 24px;">File delivered successfully.</p>
+        <div class="stats">
+          <div class="stat">
+            <div class="stat-value" id="final-speed">--</div>
+            <div class="stat-label">Avg Speed</div>
+          </div>
+          <div class="stat">
+            <div class="stat-value" id="final-size">--</div>
+            <div class="stat-label">File Size</div>
+          </div>
+          <div class="stat">
+            <div class="stat-value" id="final-time">--</div>
+            <div class="stat-label">Time</div>
+          </div>
+          <div class="stat">
+            <div class="stat-value" id="final-channels">8</div>
+            <div class="stat-label">Channels</div>
+          </div>
+        </div>
+        <a href="/send" class="btn btn-primary" style="margin-top: 24px;">Send Another File</a>
+      </div>
+    </div>
+  </div>
+
+  <!-- AdSense: Bottom leaderboard -->
+  <div style="text-align:center; margin: 24px auto; max-width: 728px;">
+    <ins class="adsbygoogle"
+         style="display:block"
+         data-ad-client="ca-pub-XXXXXXXXXXXXXXXX"
+         data-ad-slot="XXXXXXXXXX"
+         data-ad-format="horizontal"
+         data-full-width-responsive="true"></ins>
+    <script>(adsbygoogle = window.adsbygoogle || []).push({});</script>
+  </div>
+
+  <script src="/static/js/transfer.js"></script>
+  <script src="/static/js/send.js"></script>
+</body>
+</html>

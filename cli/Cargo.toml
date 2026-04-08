@@ -1,0 +1,28 @@
+[package]
+name = "fasttransfer-cli"
+version = "0.1.0"
+edition = "2021"
+description = "High-speed P2P file transfer CLI"
+
+[[bin]]
+name = "fasttransfer"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+indicatif = "0.17"
+futures-util = "0.3"
+sha2 = "0.10"
+hex = "0.4"
+anyhow = "1"
+reqwest = { version = "0.12", features = ["json"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

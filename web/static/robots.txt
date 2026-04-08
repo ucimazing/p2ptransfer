@@ -1,0 +1,8 @@
+User-agent: *
+Allow: /
+Allow: /send
+Disallow: /receive/
+Disallow: /ws
+Disallow: /api/
+
+Sitemap: https://fasttransfer.io/sitemap.xml
