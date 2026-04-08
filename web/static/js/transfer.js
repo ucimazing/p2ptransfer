@@ -2,19 +2,19 @@
  * FastTransfer — High-speed WebRTC file transfer engine.
  *
  * Speed optimizations:
- * 1. 8 parallel DataChannels to saturate full bandwidth
+ * 1. 4 parallel DataChannels with staggered start (avoids SCTP burst crash)
  * 2. 256KB chunks — reduces per-chunk overhead by 4x vs 64KB
  * 3. Unordered delivery — eliminates head-of-line blocking
  * 4. Binary ArrayBuffer transfer — zero encoding overhead
  * 5. Per-channel async pumps with backpressure via onbufferedamountlow
- * 6. Aggressive 8MB send buffer — keeps the SCTP pipeline full
- * 7. Chunk pre-reading — overlaps file I/O with network sends
+ * 6. 4MB send buffer per channel — keeps the SCTP pipeline full
+ * 7. Chunk pre-reading — overlaps file I/O with network sends (after warmup)
  */
 
 const CHUNK_SIZE = 256 * 1024; // 256KB per chunk — 4x less overhead than 64KB
-const NUM_CHANNELS = 8; // 8 parallel data channels to saturate bandwidth
-const BUFFER_THRESHOLD = 2 * 1024 * 1024; // 2MB — resume sending when buffer drops below this
-const MAX_BUFFER = 8 * 1024 * 1024; // 8MB — pause sending when buffer exceeds this
+const NUM_CHANNELS = 4; // 4 parallel channels (8 overwhelms SCTP transport on burst)
+const BUFFER_THRESHOLD = 1 * 1024 * 1024; // 1MB — resume sending when buffer drops below this
+const MAX_BUFFER = 4 * 1024 * 1024; // 4MB — pause sending when buffer exceeds this
 
 class TransferEngine {
   constructor(role, signaling) {
@@ -322,9 +322,12 @@ class TransferEngine {
     // (safe because JS is single-threaded; no two pumps run simultaneously)
     this._nextChunkIndex = 0;
 
-    // Launch one independent pump per channel
+    // Launch one independent pump per channel, staggered to avoid SCTP burst overload
+    // Each pump starts 50ms after the previous one — total ramp-up: ~200ms
     for (let i = 0; i < this.channels.length; i++) {
-      this._channelPump(this.channels[i], i);
+      ((idx) => {
+        setTimeout(() => this._channelPump(this.channels[idx], idx), idx * 50);
+      })(i);
     }
   }
 
@@ -335,6 +338,7 @@ class TransferEngine {
    */
   async _channelPump(channel, channelIndex) {
     let prefetchedChunk = null; // { index, combined } — pre-read chunk ready to send
+    let isFirstSend = true; // Skip prefetch on first iteration to avoid SCTP burst
 
     while (true) {
       let index, combined;
@@ -362,12 +366,16 @@ class TransferEngine {
       }
 
       // Pre-read NEXT chunk while we wait for buffer space (overlaps I/O with network)
-      const nextIndex = this._nextChunkIndex;
+      // Skip prefetch on first send to let SCTP transport warm up
       let prefetchPromise = null;
-      if (nextIndex < this.totalChunks) {
-        this._nextChunkIndex++;
-        prefetchPromise = this._readChunk(nextIndex).then(c => ({ index: nextIndex, combined: c }));
+      if (!isFirstSend) {
+        const nextIndex = this._nextChunkIndex;
+        if (nextIndex < this.totalChunks) {
+          this._nextChunkIndex++;
+          prefetchPromise = this._readChunk(nextIndex).then(c => ({ index: nextIndex, combined: c }));
+        }
       }
+      isFirstSend = false;
 
       // Wait for buffer space before sending
       await this._waitForBufferSpace(channel);
