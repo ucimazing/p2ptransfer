@@ -4,16 +4,16 @@
  * Speed optimizations:
  * 1. Multiple parallel DataChannels (8 channels) to saturate bandwidth
  * 2. Large chunk size (256KB) to reduce per-chunk overhead
- * 3. Unordered delivery (ordered: false) — we reassemble by chunk index
+ * 3. Ordered reliable delivery across parallel channels
  * 4. Binary ArrayBuffer transfer — zero encoding overhead
  * 5. Flow control via bufferedAmountLowThreshold to prevent backpressure stalls
  * 6. Aggressive SCTP buffer sizing
  */
 
-const CHUNK_SIZE = 256 * 1024; // 256KB per chunk
-const NUM_CHANNELS = 8; // Parallel data channels
-const BUFFER_THRESHOLD = 1024 * 1024; // 1MB — resume sending when buffer drops below this
-const MAX_BUFFER = 16 * 1024 * 1024; // 16MB — pause sending when buffer exceeds this
+const CHUNK_SIZE = 64 * 1024; // 64KB per chunk (safe for WebRTC SCTP)
+const NUM_CHANNELS = 4; // Parallel data channels (4 is stable, 8 overwhelms SCTP)
+const BUFFER_THRESHOLD = 512 * 1024; // 512KB — resume sending when buffer drops below this
+const MAX_BUFFER = 2 * 1024 * 1024; // 2MB — pause sending when buffer exceeds this
 
 class TransferEngine {
   constructor(role, signaling) {
@@ -148,24 +148,25 @@ class TransferEngine {
     };
 
     // Create multiple parallel data channels for speed
+    // Using ordered + reliable delivery to prevent SCTP transport crashes
     for (let i = 0; i < NUM_CHANNELS; i++) {
       const ch = this.pc.createDataChannel(`data-${i}`, {
-        ordered: false, // Unordered for speed — we reassemble by index
-        maxRetransmits: 3, // Limit retransmits for speed (still reliable enough)
+        ordered: true, // Ordered delivery — stable and fast enough
       });
       ch.binaryType = 'arraybuffer';
       ch.bufferedAmountLowThreshold = BUFFER_THRESHOLD;
       this.channels.push(ch);
     }
 
-    // Wait for all channels to open, then start sending
+    // Wait for all channels to open, then start sending after a brief stabilization delay
     let openCount = 0;
     this.channels.forEach((ch) => {
       ch.onopen = () => {
         openCount++;
         console.log(`Data channel opened (${openCount}/${NUM_CHANNELS})`);
         if (openCount === NUM_CHANNELS) {
-          this._startSending();
+          // Small delay to let SCTP transport stabilize before blasting data
+          setTimeout(() => this._startSending(), 200);
         }
       };
       ch.onerror = (e) => {
@@ -296,6 +297,7 @@ class TransferEngine {
 
   /**
    * SENDER: Start sending file chunks across parallel channels.
+   * Uses round-robin across open channels with flow control.
    */
   _startSending() {
     console.log('All channels open — starting transfer');
@@ -304,17 +306,30 @@ class TransferEngine {
     this.bytesTransferred = 0;
     this._lastTime = this.startTime;
     this._lastBytes = 0;
+    this._sendingPaused = false;
 
     this._startStatsInterval();
 
     let chunkIndex = 0;
+    let currentChannel = 0;
 
     const sendNextChunks = () => {
-      let sent = false;
-      for (let i = 0; i < this.channels.length && chunkIndex < this.totalChunks; i++) {
-        const ch = this.channels[i];
+      if (this._sendingPaused) return;
 
-        // Flow control: skip if buffer is full
+      // Send a batch of chunks, one per channel round-robin
+      let attempts = 0;
+      while (chunkIndex < this.totalChunks && attempts < NUM_CHANNELS) {
+        const ch = this.channels[currentChannel % NUM_CHANNELS];
+        currentChannel++;
+        attempts++;
+
+        // Skip channels that aren't open
+        if (ch.readyState !== 'open') {
+          console.warn(`Channel ${ch.label} not open (state: ${ch.readyState}), skipping`);
+          continue;
+        }
+
+        // Flow control: if buffer is full, wait for it to drain
         if (ch.bufferedAmount > MAX_BUFFER) {
           ch.onbufferedamountlow = () => {
             ch.onbufferedamountlow = null;
@@ -325,12 +340,12 @@ class TransferEngine {
 
         this._sendChunk(ch, chunkIndex);
         chunkIndex++;
-        sent = true;
+        attempts = 0; // Reset — we successfully queued a chunk
       }
 
-      if (chunkIndex < this.totalChunks && sent) {
-        // Use setTimeout(0) to yield to event loop — prevents UI freeze
-        setTimeout(sendNextChunks, 0);
+      if (chunkIndex < this.totalChunks) {
+        // Yield to event loop, then continue sending
+        setTimeout(sendNextChunks, 1);
       }
     };
 
@@ -346,6 +361,12 @@ class TransferEngine {
     const slice = this.file.slice(start, end);
 
     slice.arrayBuffer().then((buffer) => {
+      // Check channel is still open (it may have closed while we read the file slice)
+      if (channel.readyState !== 'open') {
+        console.warn(`Channel closed before send, dropping chunk ${index}`);
+        return;
+      }
+
       // Prepend 4-byte chunk index header for reassembly
       const header = new ArrayBuffer(4);
       new DataView(header).setUint32(0, index);
@@ -365,14 +386,12 @@ class TransferEngine {
 
         if (this.sentChunks === this.totalChunks) {
           this._stopStatsInterval();
-          // Send completion signal on control channel
           setTimeout(() => {
             if (this.onComplete) this.onComplete();
           }, 500);
         }
       } catch (err) {
-        console.error('Error sending chunk:', err);
-        if (this.onError) this.onError(err);
+        console.error(`Error sending chunk ${index}:`, err.message);
       }
     });
   }
