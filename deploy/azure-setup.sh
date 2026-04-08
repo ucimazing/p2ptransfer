@@ -92,6 +92,7 @@ echo "  Auto-update cron installed"
 # ──── Step 3: Configure firewall (Azure uses NSG, but also open locally) ────
 print_step "Configuring local firewall..."
 if command -v ufw &> /dev/null; then
+    ufw allow 22/tcp    # SSH — CRITICAL: must be first to avoid lockout
     ufw allow 80/tcp
     ufw allow 443/tcp
     ufw allow 8080/tcp

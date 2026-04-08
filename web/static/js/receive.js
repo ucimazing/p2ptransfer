@@ -11,6 +11,7 @@
   const btnStartDownload = document.getElementById('btn-start-download');
 
   let engine = null;
+  let receiveStarted = false; // Guard against double-start
 
   // --- Interstitial countdown ---
   let countdown = 5;
@@ -22,17 +23,18 @@
       countdownEl.textContent = '0';
       btnStartDownload.classList.remove('hidden');
       // Auto-start after countdown
-      startReceive();
+      if (!receiveStarted) startReceive();
     }
   }, 1000);
 
   // Manual start button (backup)
   btnStartDownload.addEventListener('click', () => {
     clearInterval(timer);
-    startReceive();
+    if (!receiveStarted) startReceive();
   });
 
   function startReceive() {
+    receiveStarted = true;
     stepInterstitial.classList.add('hidden');
     stepConnecting.classList.remove('hidden');
 

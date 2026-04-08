@@ -40,6 +40,10 @@ class TransferEngine {
     this._lastBytes = 0;
     this._lastTime = 0;
     this._statsInterval = null;
+
+    // ICE candidate buffer — queued until remote description is set
+    this._pendingCandidates = [];
+    this._remoteDescriptionSet = false;
   }
 
   /**
@@ -53,7 +57,6 @@ class TransferEngine {
       { urls: 'stun:stun2.l.google.com:19302' },
     ];
 
-    // TURN credentials are added asynchronously via _addTurnServers()
     const config = {
       iceServers: iceServers,
       iceCandidatePoolSize: 10,
@@ -76,9 +79,18 @@ class TransferEngine {
     this.pc.oniceconnectionstatechange = () => {
       const state = this.pc.iceConnectionState;
       console.log(`ICE connection state: ${state}`);
-      if (state === 'failed' || state === 'disconnected') {
-        if (this.onError) this.onError(new Error(`Connection ${state}`));
+      if (state === 'failed') {
+        console.error('ICE connection failed — peer may be behind strict NAT');
+        if (this.onError) this.onError(new Error('Connection failed — could not reach peer'));
+      } else if (state === 'disconnected') {
+        console.warn('ICE disconnected — connection may recover');
+      } else if (state === 'connected' || state === 'completed') {
+        console.log('P2P connection established!');
       }
+    };
+
+    this.pc.onconnectionstatechange = () => {
+      console.log(`Connection state: ${this.pc.connectionState}`);
     };
 
     return this.pc;
@@ -97,10 +109,14 @@ class TransferEngine {
           username: creds.username,
           credential: creds.password,
         };
-        const currentConfig = this.pc.getConfiguration();
-        currentConfig.iceServers.push(turnServer);
-        this.pc.setConfiguration(currentConfig);
-        console.log('TURN servers added');
+        try {
+          const currentConfig = this.pc.getConfiguration();
+          currentConfig.iceServers.push(turnServer);
+          this.pc.setConfiguration(currentConfig);
+          console.log('TURN servers added:', creds.uris);
+        } catch (e) {
+          console.warn('Could not update ICE config (connection already started):', e.message);
+        }
       }
     } catch (e) {
       console.log('No TURN server configured (direct P2P only)');
@@ -127,6 +143,7 @@ class TransferEngine {
       ordered: true,
     });
     controlChannel.onopen = () => {
+      console.log('Control channel open, sending file info');
       controlChannel.send(JSON.stringify({ type: 'file-info', payload: this.fileInfo }));
     };
 
@@ -146,18 +163,26 @@ class TransferEngine {
     this.channels.forEach((ch) => {
       ch.onopen = () => {
         openCount++;
+        console.log(`Data channel opened (${openCount}/${NUM_CHANNELS})`);
         if (openCount === NUM_CHANNELS) {
           this._startSending();
         }
+      };
+      ch.onerror = (e) => {
+        console.error('Data channel error:', e);
       };
     });
 
     const offer = await this.pc.createOffer();
     await this.pc.setLocalDescription(offer);
+    console.log('SDP offer created and set as local description');
 
     this.signaling.send({
       type: 'offer',
-      payload: this.pc.localDescription,
+      payload: {
+        type: this.pc.localDescription.type,
+        sdp: this.pc.localDescription.sdp,
+      },
     });
   }
 
@@ -165,12 +190,14 @@ class TransferEngine {
    * RECEIVER: Handle incoming offer and create answer.
    */
   async handleOffer(offer) {
+    console.log('Received offer, creating peer connection...');
     this.createPeerConnection();
 
     // Track received data channels
     let dataChannelCount = 0;
     this.pc.ondatachannel = (event) => {
       const ch = event.channel;
+      console.log(`Data channel received: ${ch.label}`);
 
       if (ch.label === 'control') {
         ch.onmessage = (e) => {
@@ -179,6 +206,7 @@ class TransferEngine {
             this.fileInfo = msg.payload;
             this.totalChunks = msg.payload.totalChunks;
             this.receivedBuffers = new Array(this.totalChunks);
+            console.log('File info received:', this.fileInfo);
             if (this.onFileInfo) this.onFileInfo(this.fileInfo);
           }
         };
@@ -195,13 +223,24 @@ class TransferEngine {
       };
     };
 
+    // Set remote description FIRST, then process buffered candidates
     await this.pc.setRemoteDescription(new RTCSessionDescription(offer));
+    console.log('Remote description set');
+
+    // Now flush any ICE candidates that arrived before setRemoteDescription
+    this._remoteDescriptionSet = true;
+    await this._flushPendingCandidates();
+
     const answer = await this.pc.createAnswer();
     await this.pc.setLocalDescription(answer);
+    console.log('SDP answer created and set as local description');
 
     this.signaling.send({
       type: 'answer',
-      payload: this.pc.localDescription,
+      payload: {
+        type: this.pc.localDescription.type,
+        sdp: this.pc.localDescription.sdp,
+      },
     });
   }
 
@@ -209,22 +248,57 @@ class TransferEngine {
    * Handle incoming answer (sender side).
    */
   async handleAnswer(answer) {
+    console.log('Received answer, setting remote description...');
     await this.pc.setRemoteDescription(new RTCSessionDescription(answer));
+    this._remoteDescriptionSet = true;
+    console.log('Remote description set (sender side)');
+
+    // Flush any pending candidates
+    await this._flushPendingCandidates();
   }
 
   /**
-   * Add ICE candidate from peer.
+   * Add ICE candidate from peer — buffers if remote description not yet set.
    */
   async addIceCandidate(candidate) {
-    if (this.pc && candidate) {
-      await this.pc.addIceCandidate(new RTCIceCandidate(candidate));
+    if (!candidate) return;
+
+    if (!this.pc || !this._remoteDescriptionSet) {
+      // Buffer the candidate — remote description hasn't been set yet
+      console.log('Buffering ICE candidate (remote description not set yet)');
+      this._pendingCandidates.push(candidate);
+      return;
     }
+
+    try {
+      await this.pc.addIceCandidate(new RTCIceCandidate(candidate));
+    } catch (e) {
+      console.warn('Failed to add ICE candidate:', e.message);
+    }
+  }
+
+  /**
+   * Flush buffered ICE candidates after remote description is set.
+   */
+  async _flushPendingCandidates() {
+    if (this._pendingCandidates.length > 0) {
+      console.log(`Flushing ${this._pendingCandidates.length} buffered ICE candidates`);
+    }
+    for (const candidate of this._pendingCandidates) {
+      try {
+        await this.pc.addIceCandidate(new RTCIceCandidate(candidate));
+      } catch (e) {
+        console.warn('Failed to add buffered ICE candidate:', e.message);
+      }
+    }
+    this._pendingCandidates = [];
   }
 
   /**
    * SENDER: Start sending file chunks across parallel channels.
    */
   _startSending() {
+    console.log('All channels open — starting transfer');
     this.startTime = performance.now();
     this.sentChunks = 0;
     this.bytesTransferred = 0;
@@ -233,11 +307,10 @@ class TransferEngine {
 
     this._startStatsInterval();
 
-    // Distribute chunks across channels round-robin
-    const reader = new FileReader();
     let chunkIndex = 0;
 
     const sendNextChunks = () => {
+      let sent = false;
       for (let i = 0; i < this.channels.length && chunkIndex < this.totalChunks; i++) {
         const ch = this.channels[i];
 
@@ -252,9 +325,10 @@ class TransferEngine {
 
         this._sendChunk(ch, chunkIndex);
         chunkIndex++;
+        sent = true;
       }
 
-      if (chunkIndex < this.totalChunks) {
+      if (chunkIndex < this.totalChunks && sent) {
         // Use setTimeout(0) to yield to event loop — prevents UI freeze
         setTimeout(sendNextChunks, 0);
       }
@@ -297,6 +371,7 @@ class TransferEngine {
           }, 500);
         }
       } catch (err) {
+        console.error('Error sending chunk:', err);
         if (this.onError) this.onError(err);
       }
     });
@@ -335,6 +410,7 @@ class TransferEngine {
    * RECEIVER: Assemble chunks and trigger download.
    */
   _assembleAndDownload() {
+    console.log('All chunks received — assembling file');
     const blob = new Blob(this.receivedBuffers, {
       type: this.fileInfo.type,
     });
@@ -433,12 +509,17 @@ class SignalingClient {
 
     this.ws.onmessage = (e) => {
       const msg = JSON.parse(e.data);
+      console.log('Signaling received:', msg.type);
       const handler = this.handlers[msg.type];
       if (handler) handler(msg.payload);
     };
 
     this.ws.onerror = (e) => {
       console.error('WebSocket error:', e);
+    };
+
+    this.ws.onclose = (e) => {
+      console.log('WebSocket closed:', e.code, e.reason);
     };
   }
 
@@ -449,6 +530,9 @@ class SignalingClient {
   send(msg) {
     if (this.ws.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify(msg));
+      console.log('Signaling sent:', msg.type);
+    } else {
+      console.warn('WebSocket not open, cannot send:', msg.type, 'readyState:', this.ws.readyState);
     }
   }
 
@@ -458,8 +542,14 @@ class SignalingClient {
         resolve();
         return;
       }
-      this.ws.onopen = resolve;
-      this.ws.onerror = reject;
+      this.ws.onopen = () => {
+        console.log('WebSocket connected');
+        resolve();
+      };
+      this.ws.onerror = (e) => {
+        console.error('WebSocket connection failed:', e);
+        reject(e);
+      };
     });
   }
 

@@ -102,6 +102,7 @@ fi
 
 # For systems with ufw
 if command -v ufw &> /dev/null; then
+    sudo ufw allow 22/tcp 2>/dev/null || true  # SSH — must be first
     sudo ufw allow 80/tcp 2>/dev/null || true
     sudo ufw allow 443/tcp 2>/dev/null || true
     sudo ufw allow 8080/tcp 2>/dev/null || true
