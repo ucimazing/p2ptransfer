@@ -3,16 +3,16 @@
  *
  * Speed optimizations:
  * 1. 4 parallel DataChannels with staggered start (avoids SCTP burst crash)
- * 2. 256KB chunks — reduces per-chunk overhead by 4x vs 64KB
- * 3. Unordered delivery — eliminates head-of-line blocking
+ * 2. 64KB chunks — max safe size for WebRTC SCTP messages
+ * 3. Ordered reliable delivery (unordered crashes SCTP with large msgs)
  * 4. Binary ArrayBuffer transfer — zero encoding overhead
  * 5. Per-channel async pumps with backpressure via onbufferedamountlow
  * 6. 4MB send buffer per channel — keeps the SCTP pipeline full
  * 7. Chunk pre-reading — overlaps file I/O with network sends (after warmup)
  */
 
-const CHUNK_SIZE = 256 * 1024; // 256KB per chunk — 4x less overhead than 64KB
-const NUM_CHANNELS = 4; // 4 parallel channels (8 overwhelms SCTP transport on burst)
+const CHUNK_SIZE = 64 * 1024; // 64KB — max safe size for WebRTC SCTP
+const NUM_CHANNELS = 4; // 4 parallel channels (8 overwhelms SCTP transport)
 const BUFFER_THRESHOLD = 1 * 1024 * 1024; // 1MB — resume sending when buffer drops below this
 const MAX_BUFFER = 4 * 1024 * 1024; // 4MB — pause sending when buffer exceeds this
 
@@ -149,11 +149,11 @@ class TransferEngine {
     };
 
     // Create multiple parallel data channels for maximum throughput
-    // Unordered: eliminates head-of-line blocking — chunks have index headers for reassembly
-    // Reliable: SCTP retransmits lost packets automatically (no data loss)
+    // Ordered + reliable: SCTP handles fragmentation and retransmission
+    // (unordered crashes SCTP transport with messages > ~16KB in Chrome)
     for (let i = 0; i < NUM_CHANNELS; i++) {
       const ch = this.pc.createDataChannel(`data-${i}`, {
-        ordered: false, // Unordered = no head-of-line blocking = much faster
+        ordered: true,
       });
       ch.binaryType = 'arraybuffer';
       ch.bufferedAmountLowThreshold = BUFFER_THRESHOLD;
