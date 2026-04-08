@@ -2,18 +2,19 @@
  * FastTransfer — High-speed WebRTC file transfer engine.
  *
  * Speed optimizations:
- * 1. Multiple parallel DataChannels (8 channels) to saturate bandwidth
- * 2. Large chunk size (256KB) to reduce per-chunk overhead
- * 3. Ordered reliable delivery across parallel channels
+ * 1. 8 parallel DataChannels to saturate full bandwidth
+ * 2. 256KB chunks — reduces per-chunk overhead by 4x vs 64KB
+ * 3. Unordered delivery — eliminates head-of-line blocking
  * 4. Binary ArrayBuffer transfer — zero encoding overhead
- * 5. Flow control via bufferedAmountLowThreshold to prevent backpressure stalls
- * 6. Aggressive SCTP buffer sizing
+ * 5. Per-channel async pumps with backpressure via onbufferedamountlow
+ * 6. Aggressive 8MB send buffer — keeps the SCTP pipeline full
+ * 7. Chunk pre-reading — overlaps file I/O with network sends
  */
 
-const CHUNK_SIZE = 64 * 1024; // 64KB per chunk (safe for WebRTC SCTP)
-const NUM_CHANNELS = 4; // Parallel data channels (4 is stable, 8 overwhelms SCTP)
-const BUFFER_THRESHOLD = 512 * 1024; // 512KB — resume sending when buffer drops below this
-const MAX_BUFFER = 2 * 1024 * 1024; // 2MB — pause sending when buffer exceeds this
+const CHUNK_SIZE = 256 * 1024; // 256KB per chunk — 4x less overhead than 64KB
+const NUM_CHANNELS = 8; // 8 parallel data channels to saturate bandwidth
+const BUFFER_THRESHOLD = 2 * 1024 * 1024; // 2MB — resume sending when buffer drops below this
+const MAX_BUFFER = 8 * 1024 * 1024; // 8MB — pause sending when buffer exceeds this
 
 class TransferEngine {
   constructor(role, signaling) {
@@ -147,11 +148,12 @@ class TransferEngine {
       controlChannel.send(JSON.stringify({ type: 'file-info', payload: this.fileInfo }));
     };
 
-    // Create multiple parallel data channels for speed
-    // Using ordered + reliable delivery to prevent SCTP transport crashes
+    // Create multiple parallel data channels for maximum throughput
+    // Unordered: eliminates head-of-line blocking — chunks have index headers for reassembly
+    // Reliable: SCTP retransmits lost packets automatically (no data loss)
     for (let i = 0; i < NUM_CHANNELS; i++) {
       const ch = this.pc.createDataChannel(`data-${i}`, {
-        ordered: true, // Ordered delivery — stable and fast enough
+        ordered: false, // Unordered = no head-of-line blocking = much faster
       });
       ch.binaryType = 'arraybuffer';
       ch.bufferedAmountLowThreshold = BUFFER_THRESHOLD;
@@ -165,8 +167,7 @@ class TransferEngine {
         openCount++;
         console.log(`Data channel opened (${openCount}/${NUM_CHANNELS})`);
         if (openCount === NUM_CHANNELS) {
-          // Small delay to let SCTP transport stabilize before blasting data
-          setTimeout(() => this._startSending(), 200);
+          this._startSending();
         }
       };
       ch.onerror = (e) => {
@@ -329,46 +330,52 @@ class TransferEngine {
 
   /**
    * Independent async sending loop for a single channel.
-   * Pulls chunks from the shared counter, handles backpressure, and retries on failure.
+   * Pulls chunks from the shared counter, handles backpressure, retries on failure.
+   * Pre-reads the NEXT chunk while waiting for buffer space — overlaps I/O with network.
    */
   async _channelPump(channel, channelIndex) {
+    let prefetchedChunk = null; // { index, combined } — pre-read chunk ready to send
+
     while (true) {
-      // Claim next chunk index (atomic in single-threaded JS)
-      const index = this._nextChunkIndex;
-      if (index >= this.totalChunks) break; // All chunks claimed
-      this._nextChunkIndex++;
+      let index, combined;
+
+      if (prefetchedChunk) {
+        // Use the pre-read chunk from last iteration
+        index = prefetchedChunk.index;
+        combined = prefetchedChunk.combined;
+        prefetchedChunk = null;
+      } else {
+        // Claim next chunk index (atomic in single-threaded JS)
+        index = this._nextChunkIndex;
+        if (index >= this.totalChunks) break;
+        this._nextChunkIndex++;
+
+        // Read the file slice
+        combined = await this._readChunk(index);
+      }
 
       // Check channel health
       if (channel.readyState !== 'open') {
         console.error(`Channel ${channelIndex} closed — cannot send chunk ${index}`);
-        // Put the chunk back (best-effort — another pump may pick up remaining work)
-        // Actually, we can't easily "unclaim" it. Instead, we'll let it fail
-        // and the transfer will stall. But this should be very rare.
         if (this.onError) this.onError(new Error(`Data channel ${channelIndex} closed unexpectedly`));
         return;
       }
 
-      // Wait for buffer space BEFORE reading the file (prevents unnecessary memory usage)
+      // Pre-read NEXT chunk while we wait for buffer space (overlaps I/O with network)
+      const nextIndex = this._nextChunkIndex;
+      let prefetchPromise = null;
+      if (nextIndex < this.totalChunks) {
+        this._nextChunkIndex++;
+        prefetchPromise = this._readChunk(nextIndex).then(c => ({ index: nextIndex, combined: c }));
+      }
+
+      // Wait for buffer space before sending
       await this._waitForBufferSpace(channel);
 
-      // Read the file slice
-      const start = index * CHUNK_SIZE;
-      const end = Math.min(start + CHUNK_SIZE, this.file.size);
-      const slice = this.file.slice(start, end);
-      const buffer = await slice.arrayBuffer();
-
-      // Prepend 4-byte chunk index header for reassembly on the receiver
-      const header = new ArrayBuffer(4);
-      new DataView(header).setUint32(0, index);
-      const combined = new Uint8Array(4 + buffer.byteLength);
-      combined.set(new Uint8Array(header), 0);
-      combined.set(new Uint8Array(buffer), 4);
-
-      // Send with retry — if the buffer filled between our check and the send call,
-      // we wait and retry rather than dropping the chunk
+      // Send with retry
       let sent = false;
       let retries = 0;
-      const MAX_RETRIES = 50;
+      const MAX_RETRIES = 100;
 
       while (!sent && retries < MAX_RETRIES) {
         if (channel.readyState !== 'open') {
@@ -378,13 +385,12 @@ class TransferEngine {
         }
 
         try {
-          channel.send(combined.buffer);
+          channel.send(combined);
           sent = true;
         } catch (err) {
-          // "send queue is full" — wait for buffer to drain and retry
           retries++;
-          if (retries % 10 === 0) {
-            console.warn(`Channel ${channelIndex}: retry ${retries} for chunk ${index} (buffered: ${formatBytes(channel.bufferedAmount)})`);
+          if (retries % 20 === 0) {
+            console.warn(`Ch${channelIndex}: retry ${retries} for chunk ${index} (buf: ${(channel.bufferedAmount / 1048576).toFixed(1)}MB)`);
           }
           await this._waitForBufferSpace(channel);
         }
@@ -392,19 +398,24 @@ class TransferEngine {
 
       if (!sent) {
         console.error(`Channel ${channelIndex}: gave up on chunk ${index} after ${MAX_RETRIES} retries`);
-        if (this.onError) this.onError(new Error(`Failed to send chunk ${index} after ${MAX_RETRIES} retries`));
+        if (this.onError) this.onError(new Error(`Failed to send chunk ${index}`));
         return;
       }
 
+      // Collect prefetched chunk (should already be resolved by now — file reads are fast)
+      if (prefetchPromise) {
+        prefetchedChunk = await prefetchPromise;
+      }
+
       // Update progress tracking
+      const chunkSize = (combined.byteLength || combined.length) - 4; // minus 4-byte header
       this.sentChunks++;
-      this.bytesTransferred += buffer.byteLength;
+      this.bytesTransferred += chunkSize;
 
       if (this.onProgress) {
         this.onProgress(this.sentChunks / this.totalChunks);
       }
 
-      // Check if transfer is complete
       if (this.sentChunks === this.totalChunks) {
         this._stopStatsInterval();
         console.log(`Transfer complete — all ${this.totalChunks} chunks sent`);
@@ -413,6 +424,22 @@ class TransferEngine {
         }, 500);
       }
     }
+  }
+
+  /**
+   * Read a file chunk and prepend the 4-byte index header.
+   * Returns an ArrayBuffer ready to send.
+   */
+  async _readChunk(index) {
+    const start = index * CHUNK_SIZE;
+    const end = Math.min(start + CHUNK_SIZE, this.file.size);
+    const buffer = await this.file.slice(start, end).arrayBuffer();
+
+    // Prepend 4-byte chunk index for receiver-side reassembly
+    const combined = new Uint8Array(4 + buffer.byteLength);
+    new DataView(combined.buffer).setUint32(0, index);
+    combined.set(new Uint8Array(buffer), 4);
+    return combined.buffer;
   }
 
   /**
@@ -425,22 +452,29 @@ class TransferEngine {
     }
 
     return new Promise((resolve) => {
-      // Use onbufferedamountlow event — fires when bufferedAmount drops below threshold
-      const onLow = () => {
+      let resolved = false;
+      const done = () => {
+        if (resolved) return;
+        resolved = true;
         channel.onbufferedamountlow = null;
         resolve();
       };
-      channel.onbufferedamountlow = onLow;
 
-      // Safety timeout: if the event doesn't fire within 5 seconds, check manually
-      // (handles edge case where bufferedAmount drops between our check and event registration)
-      setTimeout(() => {
+      // Primary: onbufferedamountlow fires when buffer drops below BUFFER_THRESHOLD
+      channel.onbufferedamountlow = done;
+
+      // Safety: poll every 50ms in case event is missed (race between check and registration)
+      const poll = setInterval(() => {
         if (channel.bufferedAmount <= MAX_BUFFER) {
-          channel.onbufferedamountlow = null;
-          resolve();
+          clearInterval(poll);
+          done();
         }
-        // If still full, the onbufferedamountlow handler will eventually fire
-      }, 200);
+      }, 50);
+
+      // Cleanup poll when resolved via event
+      const origDone = done;
+      const doneWithCleanup = () => { clearInterval(poll); origDone(); };
+      channel.onbufferedamountlow = doneWithCleanup;
     });
   }
 
