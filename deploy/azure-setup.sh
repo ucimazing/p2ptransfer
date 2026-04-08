@@ -18,6 +18,9 @@ DUCKDNS_TOKEN="${2:-}"
 EMAIL="${3:-admin@example.com}"
 TURN_SECRET="2e2ef44f4d93a7e55afd585f06695060eaeeafa7044932d1"
 
+# Auto-fix: strip .duckdns.org if user passed full domain instead of just subdomain
+DUCKDNS_SUBDOMAIN="${DUCKDNS_SUBDOMAIN%.duckdns.org}"
+
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 RED='\033[0;31m'
