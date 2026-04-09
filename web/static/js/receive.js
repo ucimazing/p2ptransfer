@@ -44,8 +44,8 @@
     signaling.waitOpen().then(() => {
       engine = new TransferEngine('receiver', signaling, ROOM_ID);
 
-      // Start WebSocket relay connection (receiver side)
-      engine._startRelayConnection('receiver');
+      // Start all 4 WebSocket relay connections (receiver side)
+      engine.startRelayReceiver();
 
       let firstOfferReceived = false;
 

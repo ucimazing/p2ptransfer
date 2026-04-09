@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -10,64 +11,71 @@ import (
 )
 
 // High-throughput WebSocket relay for file transfer.
-// Uses NextReader/NextWriter + io.Copy for zero-intermediate-buffer relay.
-// Each direction: network → gorilla read buf → io.Copy 32KB → gorilla write buf → network.
+//
+// Supports MULTIPLE parallel relay connections per room (indexed 0-3).
+// Each connection pair gets its own TCP stream → its own congestion window.
+// With 4 parallel TCP streams using OS-level CUBIC/BBR: ~40-50 MB/s.
+//
+// Relay uses NextReader/NextWriter + io.Copy for zero-copy throughput.
 
 var relayUpgrader = websocket.Upgrader{
-	ReadBufferSize:  256 * 1024, // 256KB — large buffers for throughput
+	ReadBufferSize:  256 * 1024,
 	WriteBufferSize: 256 * 1024,
 	CheckOrigin: func(r *http.Request) bool {
 		return true
 	},
-	EnableCompression: false, // Compression kills throughput and spikes CPU
+	EnableCompression: false,
 }
 
-// relayRoom holds a sender and receiver WebSocket connection for binary relay.
-type relayRoom struct {
+type relayPair struct {
 	mu       sync.Mutex
 	sender   *websocket.Conn
 	receiver *websocket.Conn
 	ready    chan struct{}
+	done     bool
 }
 
-// RelayWSHub manages WebSocket relay rooms.
+// RelayWSHub manages WebSocket relay pairs keyed by room+index.
 type RelayWSHub struct {
 	mu    sync.Mutex
-	rooms map[string]*relayRoom
+	pairs map[string]*relayPair
 }
 
-// NewRelayWSHub creates a new relay hub.
 func NewRelayWSHub() *RelayWSHub {
 	return &RelayWSHub{
-		rooms: make(map[string]*relayRoom),
+		pairs: make(map[string]*relayPair),
 	}
 }
 
-func (h *RelayWSHub) getOrCreateRoom(roomID string) *relayRoom {
+func (h *RelayWSHub) getOrCreatePair(key string) *relayPair {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	room, ok := h.rooms[roomID]
+	p, ok := h.pairs[key]
 	if !ok {
-		room = &relayRoom{ready: make(chan struct{})}
-		h.rooms[roomID] = room
+		p = &relayPair{ready: make(chan struct{})}
+		h.pairs[key] = p
 	}
-	return room
+	return p
 }
 
-func (h *RelayWSHub) removeRoom(roomID string) {
+func (h *RelayWSHub) removePair(key string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	delete(h.rooms, roomID)
+	delete(h.pairs, key)
 }
 
-// HandleRelayWS upgrades to WebSocket and relays binary data between sender and receiver.
+// HandleRelayWS handles /ws-relay?room=X&role=sender|receiver&idx=0-3
 func (h *RelayWSHub) HandleRelayWS(w http.ResponseWriter, r *http.Request) {
 	roomID := r.URL.Query().Get("room")
 	role := r.URL.Query().Get("role")
+	idx := r.URL.Query().Get("idx")
 
 	if roomID == "" || (role != "sender" && role != "receiver") {
 		http.Error(w, "Missing room or invalid role", http.StatusBadRequest)
 		return
+	}
+	if idx == "" {
+		idx = "0"
 	}
 
 	conn, err := relayUpgrader.Upgrade(w, r, nil)
@@ -75,73 +83,62 @@ func (h *RelayWSHub) HandleRelayWS(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[Relay] Upgrade error: %v", err)
 		return
 	}
-
-	// Allow large messages (256KB chunks + 4 byte header)
 	conn.SetReadLimit(512 * 1024)
 
-	room := h.getOrCreateRoom(roomID)
+	// Key = room + index → each index pair gets its own TCP relay
+	key := fmt.Sprintf("%s:%s", roomID, idx)
+	pair := h.getOrCreatePair(key)
 
-	room.mu.Lock()
+	pair.mu.Lock()
 	if role == "sender" {
-		room.sender = conn
+		pair.sender = conn
 	} else {
-		room.receiver = conn
+		pair.receiver = conn
 	}
-	bothReady := room.sender != nil && room.receiver != nil
-	room.mu.Unlock()
+	bothReady := pair.sender != nil && pair.receiver != nil
+	pair.mu.Unlock()
 
-	log.Printf("[Relay %s] %s connected", roomID, role)
+	log.Printf("[Relay %s] %s connected (idx=%s)", roomID, role, idx)
 
 	if bothReady {
-		close(room.ready) // Signal both goroutines to start relaying
+		close(pair.ready)
 	} else {
-		// Wait for the other peer
-		<-room.ready
+		<-pair.ready
 	}
 
-	room.mu.Lock()
-	sender := room.sender
-	receiver := room.receiver
-	room.mu.Unlock()
+	pair.mu.Lock()
+	sender := pair.sender
+	receiver := pair.receiver
+	pair.mu.Unlock()
 
-	// Determine direction based on role
-	var src, dst *websocket.Conn
+	// Only sender goroutine relays sender→receiver.
+	// Only receiver goroutine relays receiver→sender (for acks, not used but keeps conn alive).
 	if role == "sender" {
-		src = sender
-		dst = receiver
+		wsRelay(sender, receiver)
 	} else {
-		src = receiver
-		dst = sender
+		wsRelay(receiver, sender)
 	}
 
-	// Relay: read from src, write to dst using zero-copy NextReader/NextWriter
-	wsRelay(src, dst)
-
-	// Cleanup
 	conn.Close()
-	h.removeRoom(roomID)
-	log.Printf("[Relay %s] %s disconnected, relay ended", roomID, role)
+	h.removePair(key)
+	log.Printf("[Relay %s] %s disconnected (idx=%s)", roomID, role, idx)
 }
 
-// relay pipes binary messages from src to dst using NextReader/NextWriter.
-// This is the highest-throughput approach: no intermediate buffer allocation.
+// wsRelay pipes messages from src to dst using zero-copy NextReader/NextWriter.
 func wsRelay(src, dst *websocket.Conn) {
 	for {
 		msgType, reader, err := src.NextReader()
 		if err != nil {
 			return
 		}
-
 		writer, err := dst.NextWriter(msgType)
 		if err != nil {
 			return
 		}
-
 		if _, err := io.Copy(writer, reader); err != nil {
 			writer.Close()
 			return
 		}
-
 		if err := writer.Close(); err != nil {
 			return
 		}
