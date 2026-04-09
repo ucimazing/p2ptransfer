@@ -1,25 +1,24 @@
 /**
  * FastTransfer — Maximum-speed WebRTC file transfer engine.
  *
- * ARCHITECTURE: Multiple RTCPeerConnections with batch-send tight loops.
+ * ARCHITECTURE: 4 independent RTCPeerConnections with batch-send tight loops.
  *
- * Three critical optimizations (each ~2-3x improvement):
- * 1. MULTIPLE SCTP TRANSPORTS: 8 independent PeerConnections, each with its
- *    own congestion window. Single SCTP tops out at ~10 MB/s; 8x = ~80 MB/s.
- * 2. SDP MUNGING: Remove Chrome's b=AS bandwidth cap and set large
- *    max-message-size to eliminate artificial throttling.
- * 3. SYNCHRONOUS TIGHT SEND LOOP: Pre-read chunks into memory in batches,
- *    then blast them in a synchronous while-loop (zero async gaps between
- *    sends). Resume via onbufferedamountlow event — no polling, no setTimeout.
+ * Each PeerConnection has its own SCTP transport and congestion window.
+ * Single SCTP tops out at ~10 MB/s; 4 independent transports = ~40 MB/s.
  *
- * Target: 50 MB/s on 400 Mbps connections.
+ * Speed optimizations:
+ * 1. 4 independent SCTP transports (4x congestion windows)
+ * 2. Batch pre-read: read 16 chunks into RAM, then blast synchronously
+ * 3. Tight synchronous send loop — zero async gaps between sends
+ * 4. Resume via onbufferedamountlow (pure event-driven, no polling)
+ * 5. SDP optimization: remove bandwidth caps
  */
 
 const CHUNK_SIZE = 64 * 1024;              // 64KB per chunk
-const NUM_CONNECTIONS = 8;                  // 8 independent SCTP transports
-const BATCH_SIZE = 48;                      // Pre-read 48 chunks per batch (3MB)
-const BUFFER_LOW = 256 * 1024;              // 256KB — tight feedback threshold
-const BUFFER_HIGH = 2 * 1024 * 1024;        // 2MB — pause and wait for drain
+const NUM_CONNECTIONS = 4;                  // 4 independent SCTP transports
+const BATCH_SIZE = 16;                      // Pre-read 16 chunks per batch (1MB)
+const BUFFER_LOW = 256 * 1024;              // 256KB — resume threshold
+const BUFFER_HIGH = 1 * 1024 * 1024;        // 1MB — pause threshold
 
 class TransferEngine {
   constructor(role, signaling) {
@@ -47,9 +46,10 @@ class TransferEngine {
     this._statsInterval = null;
     this._nextChunkIndex = 0;
     this._completeFired = false;
+    this._sendingStarted = false;
   }
 
-  // ─── PEER CONNECTION SETUP ──────────────────────────────────────────
+  // ─── PEER CONNECTION ───────────────────────────────────────────────
 
   _createPeerConnection(index) {
     const pc = new RTCPeerConnection({
@@ -77,14 +77,11 @@ class TransferEngine {
         console.log(`PC${index} connected`);
       } else if (state === 'failed') {
         console.error(`PC${index} ICE failed`);
-        if (this.onError) this.onError(new Error(`Connection ${index} failed`));
       }
     };
 
     return {
-      pc,
-      channel: null,
-      index,
+      pc, channel: null, index,
       remoteDescriptionSet: false,
       pendingCandidates: [],
       ready: false,
@@ -98,11 +95,7 @@ class TransferEngine {
       if (creds.uris && creds.uris.length > 0) {
         try {
           const cfg = pc.getConfiguration();
-          cfg.iceServers.push({
-            urls: creds.uris,
-            username: creds.username,
-            credential: creds.password,
-          });
+          cfg.iceServers.push({ urls: creds.uris, username: creds.username, credential: creds.password });
           pc.setConfiguration(cfg);
         } catch (e) {}
       }
@@ -110,19 +103,15 @@ class TransferEngine {
   }
 
   /**
-   * SDP MUNGING — Remove bandwidth caps and optimize SCTP parameters.
-   * Chrome can add b=AS:30 (30kbps!) to DataChannel SDP. This is the
-   * single most impactful fix per WebRTC engineering research.
+   * SDP optimization — safely create a new SDP string with bandwidth caps removed.
+   * Returns a plain {type, sdp} object (never mutates the original).
    */
-  _optimizeSDP(sdp) {
-    // Remove any bandwidth restrictions (b=AS:xx or b=TIAS:xx)
-    sdp = sdp.replace(/b=AS:\d+\r?\n/g, '');
-    sdp = sdp.replace(/b=TIAS:\d+\r?\n/g, '');
-    // Ensure large max-message-size (256KB)
-    if (sdp.includes('max-message-size')) {
-      sdp = sdp.replace(/a=max-message-size:\d+/g, 'a=max-message-size:262144');
-    }
-    return sdp;
+  _optimizeSDP(type, sdp) {
+    let s = sdp;
+    // Remove any bandwidth restrictions
+    s = s.replace(/b=AS:\d+\r?\n/g, '');
+    s = s.replace(/b=TIAS:\d+\r?\n/g, '');
+    return { type, sdp: s };
   }
 
   // ─── SENDER ─────────────────────────────────────────────────────────
@@ -157,18 +146,19 @@ class TransferEngine {
       ch.onopen = () => {
         console.log(`PC${i} data channel open`);
         conn.ready = true;
-        this._checkAllReady();
+        this._tryStartSending();
       };
       ch.onerror = (e) => console.error(`PC${i} channel error:`, e);
 
       this.connections.push(conn);
     }
 
-    // Create and send all offers with SDP optimization
+    // Create and send all offers
     for (const conn of this.connections) {
       const offer = await conn.pc.createOffer();
-      offer.sdp = this._optimizeSDP(offer.sdp);
-      await conn.pc.setLocalDescription(offer);
+      // Create a safe copy with optimized SDP (never mutate original)
+      const optimized = this._optimizeSDP(offer.type, offer.sdp);
+      await conn.pc.setLocalDescription(optimized);
 
       this.signaling.send({
         type: 'offer',
@@ -180,7 +170,7 @@ class TransferEngine {
       });
     }
 
-    console.log(`${NUM_CONNECTIONS} offers sent (SDP optimized)`);
+    console.log(`${NUM_CONNECTIONS} offers sent`);
   }
 
   async handleAnswer(payload) {
@@ -188,26 +178,50 @@ class TransferEngine {
     const conn = this.connections[index];
     if (!conn) return;
 
-    // Optimize incoming SDP too
-    const sdp = this._optimizeSDP(payload.sdp);
-    await conn.pc.setRemoteDescription(
-      new RTCSessionDescription({ type: payload.type, sdp })
-    );
+    const optimized = this._optimizeSDP(payload.type, payload.sdp);
+    await conn.pc.setRemoteDescription(new RTCSessionDescription(optimized));
     conn.remoteDescriptionSet = true;
     console.log(`PC${index} remote set (sender)`);
 
-    for (const candidate of conn.pendingCandidates) {
-      try { await conn.pc.addIceCandidate(new RTCIceCandidate(candidate)); }
-      catch (e) {}
+    for (const c of conn.pendingCandidates) {
+      try { await conn.pc.addIceCandidate(new RTCIceCandidate(c)); } catch (e) {}
     }
     conn.pendingCandidates = [];
   }
 
-  _checkAllReady() {
-    const readyCount = this.connections.filter(c => c.ready).length;
-    console.log(`Connections ready: ${readyCount}/${NUM_CONNECTIONS}`);
-    if (readyCount === NUM_CONNECTIONS) {
-      this._startSending();
+  /**
+   * Start sending as soon as at least 1 connection is ready.
+   * Additional connections join the transfer as they become ready.
+   */
+  _tryStartSending() {
+    if (this._sendingStarted) {
+      // Already started — launch a pump for the newly ready connection
+      const newReady = this.connections.filter(c => c.ready && !c.pumpStarted);
+      for (const conn of newReady) {
+        conn.pumpStarted = true;
+        console.log(`PC${conn.index} joining transfer in progress`);
+        this._batchPump(conn.channel, conn.index);
+      }
+      return;
+    }
+
+    // Start transfer on first ready connection
+    this._sendingStarted = true;
+    console.log('Starting transfer — connections will join as they become ready');
+    this.startTime = performance.now();
+    this.sentChunks = 0;
+    this.bytesTransferred = 0;
+    this._lastTime = this.startTime;
+    this._lastBytes = 0;
+    this._nextChunkIndex = 0;
+    this._startStatsInterval();
+
+    // Launch pumps for all currently ready connections
+    for (const conn of this.connections) {
+      if (conn.ready) {
+        conn.pumpStarted = true;
+        this._batchPump(conn.channel, conn.index);
+      }
     }
   }
 
@@ -218,7 +232,6 @@ class TransferEngine {
     console.log(`Handling offer for PC${index}`);
 
     const conn = this._createPeerConnection(index);
-
     while (this.connections.length <= index) this.connections.push(null);
     this.connections[index] = conn;
 
@@ -244,14 +257,11 @@ class TransferEngine {
       ch.onmessage = (e) => this._handleChunk(e.data);
     };
 
-    // Optimize incoming SDP
-    const sdp = this._optimizeSDP(payload.sdp);
-    await conn.pc.setRemoteDescription(
-      new RTCSessionDescription({ type: payload.type, sdp })
-    );
+    const optimized = this._optimizeSDP(payload.type, payload.sdp);
+    await conn.pc.setRemoteDescription(new RTCSessionDescription(optimized));
     conn.remoteDescriptionSet = true;
 
-    // Flush any ICE candidates that arrived before this connection was created
+    // Flush global pending ICE (arrived before connection was created)
     if (this._globalPendingIce && this._globalPendingIce[index]) {
       for (const c of this._globalPendingIce[index]) {
         try { await conn.pc.addIceCandidate(new RTCIceCandidate(c)); } catch (e) {}
@@ -259,15 +269,14 @@ class TransferEngine {
       delete this._globalPendingIce[index];
     }
 
-    for (const candidate of conn.pendingCandidates) {
-      try { await conn.pc.addIceCandidate(new RTCIceCandidate(candidate)); }
-      catch (e) {}
+    for (const c of conn.pendingCandidates) {
+      try { await conn.pc.addIceCandidate(new RTCIceCandidate(c)); } catch (e) {}
     }
     conn.pendingCandidates = [];
 
     const answer = await conn.pc.createAnswer();
-    answer.sdp = this._optimizeSDP(answer.sdp);
-    await conn.pc.setLocalDescription(answer);
+    const optAnswer = this._optimizeSDP(answer.type, answer.sdp);
+    await conn.pc.setLocalDescription(optAnswer);
 
     this.signaling.send({
       type: 'answer',
@@ -298,100 +307,64 @@ class TransferEngine {
       return;
     }
 
-    try {
-      await conn.pc.addIceCandidate(new RTCIceCandidate(candidate));
-    } catch (e) {}
+    try { await conn.pc.addIceCandidate(new RTCIceCandidate(candidate)); } catch (e) {}
   }
 
-  // ─── HIGH-SPEED SENDING ENGINE ─────────────────────────────────────
+  // ─── BATCH SEND ENGINE ─────────────────────────────────────────────
 
   /**
-   * Start sending: launch one batch pump per connection, staggered.
-   */
-  _startSending() {
-    console.log(`All ${NUM_CONNECTIONS} connections ready — starting high-speed transfer`);
-    this.startTime = performance.now();
-    this.sentChunks = 0;
-    this.bytesTransferred = 0;
-    this._lastTime = this.startTime;
-    this._lastBytes = 0;
-    this._nextChunkIndex = 0;
-
-    this._startStatsInterval();
-
-    // Stagger starts: 20ms between each connection
-    for (let i = 0; i < this.connections.length; i++) {
-      const conn = this.connections[i];
-      setTimeout(() => this._batchPump(conn.channel, i), i * 20);
-    }
-  }
-
-  /**
-   * BATCH PUMP — The core high-speed sending loop for one connection.
+   * BATCH PUMP — High-speed sending loop for one connection.
    *
-   * Strategy:
-   * 1. Pre-read BATCH_SIZE chunks from file into memory (async, done once)
-   * 2. Blast them in a SYNCHRONOUS tight loop — no async gaps between sends
-   * 3. When buffer fills, onbufferedamountlow resumes the loop (pure event-driven)
-   * 4. When batch is exhausted, read next batch (only async boundary)
-   * 5. Repeat until all chunks sent
-   *
-   * This eliminates the #1 throughput killer: async/await gaps between sends.
+   * 1. Claim & read BATCH_SIZE chunks sequentially into memory
+   * 2. Blast them in a SYNCHRONOUS while-loop (zero async gaps)
+   * 3. When buffer fills → onbufferedamountlow resumes (pure event-driven)
+   * 4. When batch exhausted → read next batch (only async boundary)
    */
   async _batchPump(channel, connIndex) {
     while (true) {
-      // ── Step 1: Claim and pre-read a batch of chunks ──
+      // Step 1: Claim and read a batch of chunks (sequential reads — reliable)
       const batch = [];
       for (let i = 0; i < BATCH_SIZE; i++) {
         const idx = this._nextChunkIndex;
         if (idx >= this.totalChunks) break;
         this._nextChunkIndex++;
-        batch.push({ index: idx, data: null });
-      }
 
-      if (batch.length === 0) break; // All chunks claimed by other connections
-
-      // Read all chunks in this batch into memory (parallel file reads)
-      await Promise.all(batch.map(async (item) => {
-        const start = item.index * CHUNK_SIZE;
+        const start = idx * CHUNK_SIZE;
         const end = Math.min(start + CHUNK_SIZE, this.file.size);
         const buffer = await this.file.slice(start, end).arrayBuffer();
         const combined = new Uint8Array(4 + buffer.byteLength);
-        new DataView(combined.buffer).setUint32(0, item.index);
+        new DataView(combined.buffer).setUint32(0, idx);
         combined.set(new Uint8Array(buffer), 4);
-        item.data = combined.buffer;
-        item.size = buffer.byteLength;
-      }));
+        batch.push({ data: combined.buffer, size: buffer.byteLength });
+      }
 
-      // ── Step 2: Blast the batch in a synchronous tight loop ──
+      if (batch.length === 0) break; // All chunks claimed
+
+      // Step 2: Blast the batch synchronously
       let batchIdx = 0;
 
-      // Wrap the synchronous send loop in a Promise that resolves
-      // when the entire batch is sent (may pause/resume via events)
-      await new Promise((resolveBatch) => {
+      await new Promise((resolve) => {
         const sendTight = () => {
           while (batchIdx < batch.length) {
             if (channel.readyState !== 'open') {
-              if (this.onError) this.onError(new Error(`PC${connIndex} closed`));
-              resolveBatch();
+              console.error(`PC${connIndex} channel closed during send`);
+              resolve();
               return;
             }
 
-            // Check buffer BEFORE sending — if full, wait for drain event
             if (channel.bufferedAmount > BUFFER_HIGH) {
               channel.onbufferedamountlow = sendTight;
-              return; // Event will call us back
+              return; // Event will resume us
             }
 
             try {
               channel.send(batch[batchIdx].data);
             } catch (err) {
-              // Buffer overflow between check and send — wait for drain
+              // Buffer full between check and send — wait for drain
               channel.onbufferedamountlow = sendTight;
               return;
             }
 
-            // Track progress
             this.sentChunks++;
             this.bytesTransferred += batch[batchIdx].size;
             batchIdx++;
@@ -408,20 +381,18 @@ class TransferEngine {
             }
           }
 
-          // Entire batch sent
           channel.onbufferedamountlow = null;
-          resolveBatch();
+          resolve();
         };
 
         sendTight();
       });
 
-      // Check if this connection's channel died during sending
       if (channel.readyState !== 'open') return;
     }
   }
 
-  // ─── RECEIVING ENGINE ──────────────────────────────────────────────
+  // ─── RECEIVING ─────────────────────────────────────────────────────
 
   _handleChunk(data) {
     if (!this.startTime) {
