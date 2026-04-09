@@ -78,7 +78,7 @@
       const signaling = new SignalingClient(wsUrl);
       await signaling.waitOpen();
 
-      engine = new TransferEngine('sender', signaling);
+      engine = new TransferEngine('sender', signaling, roomId);
 
       // Handle signaling messages
       signaling.on('peer-joined', () => {

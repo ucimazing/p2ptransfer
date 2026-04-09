@@ -23,6 +23,7 @@ func main() {
 
 	hub := signaling.NewHub()
 	h := handlers.NewHandler(hub)
+	relayWSHub := handlers.NewRelayWSHub()
 
 	// Parse templates
 	tmplDir := filepath.Join(root, "web", "templates")
@@ -32,6 +33,7 @@ func main() {
 	http.HandleFunc("/api/room", h.HandleCreateRoom)
 	http.HandleFunc("/api/turn", handlers.HandleTURNCredentials)
 	http.HandleFunc("/ws", h.HandleWebSocket)
+	http.HandleFunc("/ws-relay", relayWSHub.HandleRelayWS)
 
 	// Static files
 	staticDir := filepath.Join(root, "web", "static")

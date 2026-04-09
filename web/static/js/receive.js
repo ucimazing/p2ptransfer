@@ -42,7 +42,10 @@
     const signaling = new SignalingClient(wsUrl);
 
     signaling.waitOpen().then(() => {
-      engine = new TransferEngine('receiver', signaling);
+      engine = new TransferEngine('receiver', signaling, ROOM_ID);
+
+      // Start WebSocket relay connection (receiver side)
+      engine._startRelayConnection('receiver');
 
       let firstOfferReceived = false;
 
