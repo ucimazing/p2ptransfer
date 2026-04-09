@@ -125,7 +125,9 @@ func (h *RelayWSHub) HandleRelayWS(w http.ResponseWriter, r *http.Request) {
 }
 
 // wsRelay pipes messages from src to dst using zero-copy NextReader/NextWriter.
+// Uses a 256KB copy buffer (vs default 32KB) to reduce syscall overhead.
 func wsRelay(src, dst *websocket.Conn) {
+	buf := make([]byte, 256*1024) // 256KB copy buffer
 	for {
 		msgType, reader, err := src.NextReader()
 		if err != nil {
@@ -135,7 +137,7 @@ func wsRelay(src, dst *websocket.Conn) {
 		if err != nil {
 			return
 		}
-		if _, err := io.Copy(writer, reader); err != nil {
+		if _, err := io.CopyBuffer(writer, reader, buf); err != nil {
 			writer.Close()
 			return
 		}

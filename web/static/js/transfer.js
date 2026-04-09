@@ -17,11 +17,11 @@
 
 const CHUNK_SIZE = 64 * 1024;
 const NUM_P2P = 4;                          // WebRTC P2P connections
-const NUM_RELAY = 4;                        // WebSocket relay connections
-const BATCH_SIZE = 16;                      // Chunks per batch read
+const NUM_RELAY = 8;                        // WebSocket relay connections (8 TCP streams)
+const BATCH_SIZE = 32;                      // Chunks per batch read (2MB per batch)
 const P2P_BUF_LOW = 256 * 1024;            // P2P resume threshold
 const P2P_BUF_HIGH = 1024 * 1024;          // P2P pause threshold
-const RELAY_BUF_HIGH = 2 * 1024 * 1024;    // Relay pause threshold
+const RELAY_BUF_HIGH = 8 * 1024 * 1024;    // 8MB relay buffer — keep TCP pipeline full
 
 class TransferEngine {
   constructor(role, signaling, roomId) {
