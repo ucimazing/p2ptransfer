@@ -28,10 +28,137 @@ const CHUNK_PAYLOAD_SIZE = 64 * 1024 - 4; // 65532 bytes of file data per chunk
 const CHUNK_SIZE = CHUNK_PAYLOAD_SIZE;    // Alias used by totalChunks calculation
 const NUM_P2P = 4;                        // WebRTC P2P connections
 const NUM_RELAY = 8;                      // WebSocket relay connections (8 TCP streams)
-const BATCH_SIZE = 256;                   // 256 × ~64KB ≈ 16MB per batch (one disk read)
+const BATCH_SIZE = 64;                    // 64 × ~64KB ≈ 4MB per batch (one disk read)
 const P2P_BUF_LOW = 256 * 1024;           // P2P resume threshold
 const P2P_BUF_HIGH = 1 * 1024 * 1024;     // P2P pause threshold (1MB)
-const RELAY_BUF_HIGH = 16 * 1024 * 1024;  // 16MB relay buffer — keep TCP pipeline saturated
+const RELAY_BUF_HIGH = 8 * 1024 * 1024;   // 8MB relay buffer — keeps TCP pipeline full without over-buffering
+
+/**
+ * StreamingDownloader — writes incoming bytes to a real Chrome download
+ * (visible in the downloads bar with progress), via a service worker.
+ *
+ * Usage:
+ *   const dl = new StreamingDownloader();
+ *   await dl.prepare({ name, size, mime });    // registers with SW, opens the download
+ *   dl.write(uint8array);                       // write bytes, in any order BUT in-order
+ *   dl.close();                                 // finishes the download
+ *
+ * Falls back to in-memory Blob download if:
+ *   - Service workers aren't supported (old Safari)
+ *   - Page is served over HTTP (SWs require HTTPS)
+ *   - SW registration fails
+ */
+class StreamingDownloader {
+  constructor() {
+    this.id = 'dl-' + Math.random().toString(36).slice(2, 12);
+    this.mode = null; // 'sw' | 'blob'
+    this.fallbackChunks = [];
+    this.fallbackMime = 'application/octet-stream';
+    this.fallbackName = 'download';
+  }
+
+  async prepare({ name, size, mime }) {
+    this.fallbackName = name;
+    this.fallbackMime = mime || 'application/octet-stream';
+
+    // Try the service-worker path first
+    if ('serviceWorker' in navigator && window.isSecureContext) {
+      try {
+        const reg = await navigator.serviceWorker.register('/sw.js', { scope: '/' });
+        // Wait for an active SW (the one that will actually handle /sw-download/...)
+        const sw = await this._waitForActive(reg);
+        if (sw) {
+          // Register this download with the SW via a MessageChannel (reliable reply)
+          const mc = new MessageChannel();
+          const ack = new Promise((resolve) => {
+            mc.port1.onmessage = (e) => resolve(e.data);
+          });
+          sw.postMessage({
+            type: 'register',
+            id: this.id,
+            filename: name,
+            size,
+            mime: this.fallbackMime,
+          }, [mc.port2]);
+          await ack;
+
+          // Open a hidden iframe pointed at /sw-download/<id>. This triggers
+          // a fetch that the SW intercepts with a ReadableStream response,
+          // which Chrome turns into a real file download.
+          const iframe = document.createElement('iframe');
+          iframe.hidden = true;
+          iframe.src = `/sw-download/${encodeURIComponent(this.id)}`;
+          document.body.appendChild(iframe);
+          this._iframe = iframe;
+          this._sw = sw;
+          this.mode = 'sw';
+          console.log('[download] streaming via service worker');
+          return;
+        }
+      } catch (e) {
+        console.warn('[download] SW streaming unavailable, falling back to Blob:', e);
+      }
+    }
+
+    // Blob fallback (buffers entire file in memory, download appears at end)
+    this.mode = 'blob';
+    console.log('[download] using Blob fallback (non-streaming)');
+  }
+
+  write(uint8) {
+    if (this.mode === 'sw') {
+      // Transfer the underlying buffer to avoid a copy
+      const buf = uint8.buffer.slice(uint8.byteOffset, uint8.byteOffset + uint8.byteLength);
+      this._sw.postMessage({ type: 'chunk', id: this.id, data: buf }, [buf]);
+    } else {
+      this.fallbackChunks.push(uint8);
+    }
+  }
+
+  close() {
+    if (this.mode === 'sw') {
+      this._sw.postMessage({ type: 'close', id: this.id });
+      // Tidy up the iframe after a delay — the download has already started
+      setTimeout(() => {
+        if (this._iframe && this._iframe.parentNode) {
+          this._iframe.parentNode.removeChild(this._iframe);
+        }
+      }, 2000);
+    } else {
+      // Blob fallback: assemble now and trigger the download
+      const blob = new Blob(this.fallbackChunks, { type: this.fallbackMime });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = this.fallbackName;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 5000);
+      this.fallbackChunks = [];
+    }
+  }
+
+  abort(reason) {
+    if (this.mode === 'sw' && this._sw) {
+      try { this._sw.postMessage({ type: 'abort', id: this.id, reason }); } catch (e) {}
+    }
+    this.fallbackChunks = [];
+  }
+
+  _waitForActive(reg) {
+    return new Promise((resolve) => {
+      if (reg.active) { resolve(reg.active); return; }
+      const worker = reg.installing || reg.waiting;
+      if (!worker) { resolve(null); return; }
+      worker.addEventListener('statechange', () => {
+        if (worker.state === 'activated') resolve(worker);
+      });
+      // Fallback: poll briefly
+      setTimeout(() => resolve(reg.active || null), 3000);
+    });
+  }
+}
 
 /**
  * MessageChannel yield — bypasses setTimeout's 4ms minimum after 5 nested levels.
@@ -85,6 +212,11 @@ class TransferEngine {
     this._retryIndices = [];  // Chunks un-sent by a failed pump — other pumps pick them up
     this._completeFired = false;
     this._sendingStarted = false;
+
+    // Streaming download state (receiver side)
+    this._downloader = null;
+    this._nextWriteIndex = 0;   // Next chunk index to stream into the downloader
+    this._pendingChunks = new Map(); // out-of-order chunks buffered by index
   }
 
   // ─── P2P SETUP ─────────────────────────────────────────────────────
@@ -218,10 +350,7 @@ class TransferEngine {
           try {
             const msg = JSON.parse(e.data);
             if (msg.type === 'file-info' && !this.fileInfo) {
-              this.fileInfo = msg.payload;
-              this.totalChunks = msg.payload.totalChunks;
-              this.receivedBuffers = new Array(this.totalChunks);
-              if (this.onFileInfo) this.onFileInfo(this.fileInfo);
+              this._onFileInfoReceived(msg.payload);
             }
           } catch (err) {}
         } else {
@@ -230,6 +359,24 @@ class TransferEngine {
       };
       ws.onerror = () => console.warn(`Relay${i} receiver error`);
     }
+  }
+
+  // Called on the receiver when the file-info arrives (from either P2P control
+  // channel or the first relay WebSocket). Sets up the streaming downloader.
+  async _onFileInfoReceived(info) {
+    this.fileInfo = info;
+    this.totalChunks = info.totalChunks;
+    this._downloader = new StreamingDownloader();
+    try {
+      await this._downloader.prepare({
+        name: info.name,
+        size: info.size,
+        mime: info.type || 'application/octet-stream',
+      });
+    } catch (e) {
+      console.error('[download] prepare failed:', e);
+    }
+    if (this.onFileInfo) this.onFileInfo(this.fileInfo);
   }
 
   async handleOffer(payload) {
@@ -244,10 +391,7 @@ class TransferEngine {
         ch.onmessage = (e) => {
           const msg = JSON.parse(e.data);
           if (msg.type === 'file-info' && !this.fileInfo) {
-            this.fileInfo = msg.payload;
-            this.totalChunks = msg.payload.totalChunks;
-            this.receivedBuffers = new Array(this.totalChunks);
-            if (this.onFileInfo) this.onFileInfo(this.fileInfo);
+            this._onFileInfoReceived(msg.payload);
           }
         };
         return;
@@ -509,18 +653,44 @@ class TransferEngine {
     if (this.onProgress) this.onProgress(this.sentChunks / this.totalChunks);
     if (this.sentChunks === this.totalChunks && !this._completeFired) {
       this._completeFired = true;
-      this._stopStatsInterval();
-      console.log(`Transfer complete — ${this.totalChunks} chunks sent`);
-      setTimeout(() => { if (this.onComplete) this.onComplete(); }, 500);
+      console.log(`Transfer complete — ${this.totalChunks} chunks queued, waiting for buffers to drain`);
+      // Don't stop stats or fire onComplete yet — data may still be in TCP/SCTP
+      // buffers. Wait for all connection buffers to hit zero first.
+      this._waitForDrain().then(() => {
+        this._stopStatsInterval();
+        console.log('All buffers drained — transfer fully delivered');
+        if (this.onComplete) this.onComplete();
+      });
+    }
+  }
+
+  async _waitForDrain() {
+    const yielder = createYielder();
+    try {
+      while (true) {
+        let totalBuffered = 0;
+        for (const ws of this.relayConns) {
+          if (ws && ws.readyState === WebSocket.OPEN) totalBuffered += ws.bufferedAmount;
+        }
+        for (const conn of this.connections) {
+          if (conn && conn.channel && conn.channel.readyState === 'open') {
+            totalBuffered += conn.channel.bufferedAmount;
+          }
+        }
+        if (totalBuffered === 0) return;
+        await yielder.yield();
+      }
+    } finally {
+      yielder.destroy();
     }
   }
 
   // ─── RECEIVER ──────────────────────────────────────────────────────
 
   /**
-   * Handle incoming chunk — zero-copy with Uint8Array view.
-   * Previous: data.slice(4) created a full copy of chunk data.
-   * Now: new Uint8Array(data, 4) creates a VIEW — no copy, same performance.
+   * Handle incoming chunk — zero-copy decode, then stream to the downloader
+   * in strict index order. Out-of-order chunks are buffered until their
+   * predecessors arrive so the download stream stays monotonic.
    */
   _handleChunk(data) {
     if (!this.startTime) {
@@ -531,34 +701,59 @@ class TransferEngine {
     }
     const view = new DataView(data);
     const index = view.getUint32(0);
-    if (this.receivedBuffers[index]) return; // Dedup — chunk already received
 
-    // Zero-copy: Uint8Array view into the original ArrayBuffer (skips 4-byte header)
+    // Dedup — chunk already received (via another pump)
+    if (index < this._nextWriteIndex || this._pendingChunks.has(index)) return;
+
+    // Zero-copy view into the original ArrayBuffer (skips 4-byte header)
     const chunkData = new Uint8Array(data, 4);
-    this.receivedBuffers[index] = chunkData;
     this.receivedChunks++;
     this.bytesTransferred += chunkData.byteLength;
+
+    // Stream in order to the downloader
+    if (index === this._nextWriteIndex) {
+      this._writeChunk(chunkData);
+      this._nextWriteIndex++;
+      // Drain any buffered follow-on chunks
+      while (this._pendingChunks.has(this._nextWriteIndex)) {
+        const next = this._pendingChunks.get(this._nextWriteIndex);
+        this._pendingChunks.delete(this._nextWriteIndex);
+        this._writeChunk(next);
+        this._nextWriteIndex++;
+      }
+    } else {
+      // Out of order — stash until the gap closes
+      this._pendingChunks.set(index, chunkData);
+    }
+
     if (this.onProgress) this.onProgress(this.receivedChunks / this.totalChunks);
+
     if (this.receivedChunks === this.totalChunks) {
       this._stopStatsInterval();
-      this._assembleAndDownload();
+      this._finishDownload();
     }
   }
 
-  _assembleAndDownload() {
-    console.log('All chunks received — assembling file');
-    const blob = new Blob(this.receivedBuffers, { type: this.fileInfo.type });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url; a.download = this.fileInfo.name;
-    document.body.appendChild(a); a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-    this.receivedBuffers = [];
+  _writeChunk(uint8) {
+    if (this._downloader) {
+      this._downloader.write(uint8);
+    }
+  }
+
+  _finishDownload() {
+    console.log('All chunks received — finishing download');
+    if (this._downloader) {
+      this._downloader.close();
+    }
+    this._pendingChunks.clear();
     const elapsed = (performance.now() - this.startTime) / 1000;
     if (this.onComplete) {
-      this.onComplete({ fileName: this.fileInfo.name, fileSize: this.fileInfo.size,
-        elapsed, avgSpeed: this.fileInfo.size / elapsed });
+      this.onComplete({
+        fileName: this.fileInfo.name,
+        fileSize: this.fileInfo.size,
+        elapsed,
+        avgSpeed: this.fileInfo.size / elapsed,
+      });
     }
   }
 

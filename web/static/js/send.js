@@ -151,11 +151,38 @@
 
   // --- Copy link ---
 
-  btnCopy.addEventListener('click', () => {
+  btnCopy.addEventListener('click', async () => {
+    shareUrlInput.focus();
     shareUrlInput.select();
-    navigator.clipboard.writeText(shareUrlInput.value).then(() => {
+    shareUrlInput.setSelectionRange(0, 99999); // iOS
+
+    const flashOk = () => {
       btnCopy.textContent = 'Copied!';
       setTimeout(() => { btnCopy.textContent = 'Copy'; }, 2000);
-    });
+    };
+    const flashFail = () => {
+      btnCopy.textContent = 'Press Ctrl+C';
+      setTimeout(() => { btnCopy.textContent = 'Copy'; }, 2500);
+    };
+
+    // Modern clipboard API — requires HTTPS or localhost
+    if (navigator.clipboard && window.isSecureContext) {
+      try {
+        await navigator.clipboard.writeText(shareUrlInput.value);
+        flashOk();
+        return;
+      } catch (e) {
+        // Fall through to legacy method
+      }
+    }
+
+    // Legacy fallback — works on HTTP
+    try {
+      const ok = document.execCommand('copy');
+      if (ok) flashOk();
+      else flashFail();
+    } catch (e) {
+      flashFail();
+    }
   });
 })();

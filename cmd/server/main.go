@@ -39,6 +39,16 @@ func main() {
 	staticDir := filepath.Join(root, "web", "static")
 	http.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.Dir(staticDir))))
 
+	// Service worker must be served from the root scope so it can control the
+	// whole origin (including virtual /sw-download/<id> URLs). Must also be
+	// served with Service-Worker-Allowed header and no-cache for updates.
+	http.HandleFunc("/sw.js", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+		w.Header().Set("Service-Worker-Allowed", "/")
+		http.ServeFile(w, r, filepath.Join(staticDir, "js", "sw.js"))
+	})
+
 	// Page routes
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
