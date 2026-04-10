@@ -1,27 +1,51 @@
 /**
- * FastTransfer — Maximum-speed hybrid transfer engine.
+ * FastTransfer — Maximum-speed hybrid transfer engine v3.
  *
  * ARCHITECTURE:
- *   4 WebSocket relay connections (4 TCP streams, OS CUBIC/BBR)
+ *   8 WebSocket relay connections (8 TCP streams, OS CUBIC/BBR)
  *   + 4 WebRTC P2P connections (4 SCTP streams, bonus bandwidth)
- *   = 8 parallel streams targeting 50+ MB/s
+ *   = 12 parallel streams targeting 50-125 MB/s
  *
- * Why 4 relay connections:
- *   Single TCP tops out at ~12-15 MB/s due to congestion window / RTT.
- *   4 TCP streams = 4 independent congestion windows = 4x throughput.
- *   OS TCP stack (CUBIC/BBR) is far superior to Chrome's SCTP (TCP-Reno).
+ * KEY OPTIMIZATIONS (v3):
+ *   1. MessageChannel yield — bypasses setTimeout's 4ms clamp (0.1ms vs 4ms)
+ *   2. Single-slice batch reading — 1 disk read per batch vs 64 individual reads
+ *   3. 256KB chunks — 4x fewer WebSocket frames than 64KB
+ *   4. Zero-copy chunk receive — Uint8Array view instead of ArrayBuffer.slice
+ *   5. 16MB relay buffer high-water mark — keeps TCP pipeline saturated
  *
- * All 8 streams share one atomic chunk counter. Each stream independently
+ * All streams share one atomic chunk counter. Each stream independently
  * claims chunks and sends them. Receiver deduplicates and reassembles.
  */
 
-const CHUNK_SIZE = 64 * 1024;
-const NUM_P2P = 4;                          // WebRTC P2P connections
-const NUM_RELAY = 8;                        // WebSocket relay connections (8 TCP streams)
-const BATCH_SIZE = 32;                      // Chunks per batch read (2MB per batch)
-const P2P_BUF_LOW = 256 * 1024;            // P2P resume threshold
-const P2P_BUF_HIGH = 1024 * 1024;          // P2P pause threshold
-const RELAY_BUF_HIGH = 8 * 1024 * 1024;    // 8MB relay buffer — keep TCP pipeline full
+const CHUNK_SIZE = 256 * 1024;           // 256KB — matches Go relay buffer, 4x fewer frames
+const NUM_P2P = 4;                       // WebRTC P2P connections
+const NUM_RELAY = 8;                     // WebSocket relay connections (8 TCP streams)
+const BATCH_SIZE = 64;                   // Chunks per batch (16MB per batch with single disk read)
+const P2P_BUF_LOW = 512 * 1024;         // P2P resume threshold (512KB)
+const P2P_BUF_HIGH = 2 * 1024 * 1024;   // P2P pause threshold (2MB)
+const RELAY_BUF_HIGH = 16 * 1024 * 1024; // 16MB relay buffer — keep TCP pipeline saturated
+
+/**
+ * MessageChannel yield — bypasses setTimeout's 4ms minimum after 5 nested levels.
+ * setTimeout(0) actual latency: 1ms first 5 calls, then 4ms+ forever.
+ * MessageChannel.postMessage: consistently 0.1-0.5ms.
+ *
+ * Each pump creates its own yielder for safe concurrent use.
+ */
+function createYielder() {
+  const ch = new MessageChannel();
+  ch.port2.start();
+  return {
+    yield: () => new Promise(resolve => {
+      ch.port2.onmessage = resolve;
+      ch.port1.postMessage(null);
+    }),
+    destroy: () => {
+      ch.port1.close();
+      ch.port2.close();
+    }
+  };
+}
 
 class TransferEngine {
   constructor(role, signaling, roomId) {
@@ -109,12 +133,12 @@ class TransferEngine {
       totalChunks: this.totalChunks,
     };
 
-    // 1. Start 4 relay connections FIRST (fastest to establish)
+    // 1. Start relay connections FIRST (fastest to establish)
     for (let i = 0; i < NUM_RELAY; i++) {
       this._openRelaySender(i);
     }
 
-    // 2. Start 4 P2P connections in parallel
+    // 2. Start P2P connections in parallel
     for (let i = 0; i < NUM_P2P; i++) {
       const conn = this._createPC(i);
       if (i === 0) {
@@ -295,42 +319,48 @@ class TransferEngine {
   }
 
   /**
-   * RELAY PUMP — Synchronous blast with yield-on-full pattern.
+   * RELAY PUMP — Maximum throughput with MessageChannel yield.
    *
-   * Key insight from research: setTimeout(r, 5) = 12 MB/s ceiling.
-   * Instead: synchronous loop → check bufferedAmount → yield with
-   * setTimeout(0) ONLY when full → resume immediately when drained.
+   * Key insight: setTimeout(0) has a 4ms minimum after 5 nested levels in Chrome.
+   * At 256KB chunks, 4ms/yield = 64 MB/s ceiling per connection.
+   * MessageChannel yield = 0.1-0.5ms = 512-2560 MB/s ceiling per connection.
+   *
+   * Combined with 16MB buffer high-water mark, this keeps TCP fully saturated.
    */
   async _relayPump(ws) {
-    const label = 'Relay';
-    console.log(`${label} pump started`);
+    const yielder = createYielder();
+    console.log('Relay pump started');
 
-    while (this._nextChunkIndex < this.totalChunks) {
-      // Read a batch of chunks
-      const batch = await this._readBatch();
-      if (batch.length === 0) break;
+    try {
+      while (this._nextChunkIndex < this.totalChunks) {
+        // Read a batch of chunks (single disk I/O)
+        const batch = await this._readBatch();
+        if (batch.length === 0) break;
 
-      // Blast the batch
-      for (let i = 0; i < batch.length; i++) {
-        if (ws.readyState !== WebSocket.OPEN) return;
-
-        // Backpressure: if buffer full, yield to event loop and retry
-        while (ws.bufferedAmount > RELAY_BUF_HIGH) {
+        // Blast the batch into the WebSocket
+        for (let i = 0; i < batch.length; i++) {
           if (ws.readyState !== WebSocket.OPEN) return;
-          // Yield to event loop — let TCP drain the buffer
-          await new Promise(r => setTimeout(r, 0));
-        }
 
-        ws.send(batch[i].data);
-        this.sentChunks++;
-        this.bytesTransferred += batch[i].size;
-        this._checkDone();
+          // Backpressure: yield via MessageChannel when buffer is full
+          while (ws.bufferedAmount > RELAY_BUF_HIGH) {
+            if (ws.readyState !== WebSocket.OPEN) return;
+            await yielder.yield();
+          }
+
+          ws.send(batch[i].data);
+          this.sentChunks++;
+          this.bytesTransferred += batch[i].size;
+          this._checkDone();
+        }
       }
+    } finally {
+      yielder.destroy();
     }
   }
 
   /**
-   * P2P PUMP — Synchronous tight loop with onbufferedamountlow callback.
+   * P2P PUMP — Tight loop with native onbufferedamountlow callback.
+   * No setTimeout/MessageChannel needed — browser handles backpressure natively.
    */
   async _p2pPump(channel, idx) {
     console.log(`P2P-${idx} pump started`);
@@ -366,22 +396,41 @@ class TransferEngine {
   }
 
   /**
-   * Read a batch of chunks from the shared counter.
-   * Sequential reads (reliable, no Promise.all explosion).
+   * Read a batch of chunks with SINGLE disk I/O.
+   *
+   * Previous: 64 separate file.slice().arrayBuffer() calls = 64 disk reads.
+   * Now: 1 large file.slice().arrayBuffer() + in-memory subdivision.
+   * At 256KB × 64 chunks = 16MB per batch, this is 64x fewer I/O operations.
+   *
+   * Thread-safe: _nextChunkIndex claim is synchronous (before any await),
+   * so concurrent async pumps never claim overlapping chunks.
    */
   async _readBatch() {
+    // Atomically claim a range of chunks (synchronous — no interleaving)
+    const startIdx = this._nextChunkIndex;
+    const count = Math.min(BATCH_SIZE, this.totalChunks - startIdx);
+    if (count <= 0) return [];
+    this._nextChunkIndex += count;
+
+    // Single disk read for the entire batch
+    const byteStart = startIdx * CHUNK_SIZE;
+    const byteEnd = Math.min((startIdx + count) * CHUNK_SIZE, this.file.size);
+    const bigBuf = await this.file.slice(byteStart, byteEnd).arrayBuffer();
+    const bigArr = new Uint8Array(bigBuf);
+
+    // Subdivide into chunks with 4-byte index header
     const batch = [];
-    for (let i = 0; i < BATCH_SIZE; i++) {
-      const idx = this._nextChunkIndex;
-      if (idx >= this.totalChunks) break;
-      this._nextChunkIndex++;
-      const start = idx * CHUNK_SIZE;
-      const end = Math.min(start + CHUNK_SIZE, this.file.size);
-      const buf = await this.file.slice(start, end).arrayBuffer();
-      const combined = new Uint8Array(4 + buf.byteLength);
-      new DataView(combined.buffer).setUint32(0, idx);
-      combined.set(new Uint8Array(buf), 4);
-      batch.push({ data: combined.buffer, size: buf.byteLength });
+    for (let i = 0; i < count; i++) {
+      const chunkIdx = startIdx + i;
+      const offset = i * CHUNK_SIZE;
+      const end = Math.min(offset + CHUNK_SIZE, bigBuf.byteLength);
+      const chunkLen = end - offset;
+
+      // [4-byte chunk index | chunk data]
+      const combined = new Uint8Array(4 + chunkLen);
+      new DataView(combined.buffer).setUint32(0, chunkIdx);
+      combined.set(bigArr.subarray(offset, end), 4);
+      batch.push({ data: combined.buffer, size: chunkLen });
     }
     return batch;
   }
@@ -391,13 +440,18 @@ class TransferEngine {
     if (this.sentChunks === this.totalChunks && !this._completeFired) {
       this._completeFired = true;
       this._stopStatsInterval();
-      console.log(`Transfer complete — ${this.totalChunks} chunks`);
+      console.log(`Transfer complete — ${this.totalChunks} chunks sent`);
       setTimeout(() => { if (this.onComplete) this.onComplete(); }, 500);
     }
   }
 
   // ─── RECEIVER ──────────────────────────────────────────────────────
 
+  /**
+   * Handle incoming chunk — zero-copy with Uint8Array view.
+   * Previous: data.slice(4) created a full copy of chunk data.
+   * Now: new Uint8Array(data, 4) creates a VIEW — no copy, same performance.
+   */
   _handleChunk(data) {
     if (!this.startTime) {
       this.startTime = performance.now();
@@ -407,8 +461,10 @@ class TransferEngine {
     }
     const view = new DataView(data);
     const index = view.getUint32(0);
-    const chunkData = data.slice(4);
-    if (this.receivedBuffers[index]) return; // Dedup
+    if (this.receivedBuffers[index]) return; // Dedup — chunk already received
+
+    // Zero-copy: Uint8Array view into the original ArrayBuffer (skips 4-byte header)
+    const chunkData = new Uint8Array(data, 4);
     this.receivedBuffers[index] = chunkData;
     this.receivedChunks++;
     this.bytesTransferred += chunkData.byteLength;
