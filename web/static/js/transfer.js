@@ -6,24 +6,32 @@
  *   + 4 WebRTC P2P connections (4 SCTP streams, bonus bandwidth)
  *   = 12 parallel streams targeting 50-125 MB/s
  *
- * KEY OPTIMIZATIONS (v3):
+ * KEY OPTIMIZATIONS (v3.1):
  *   1. MessageChannel yield — bypasses setTimeout's 4ms clamp (0.1ms vs 4ms)
- *   2. Single-slice batch reading — 1 disk read per batch vs 64 individual reads
- *   3. 256KB chunks — 4x fewer WebSocket frames than 64KB
+ *   2. Single-slice batch reading — 1 disk read per 256 chunks (vs 256 reads)
+ *   3. 64KB chunks (65532-byte payload + 4-byte header = 65536 on wire)
+ *      — fits WebRTC DataChannel default max-message-size of 65536
  *   4. Zero-copy chunk receive — Uint8Array view instead of ArrayBuffer.slice
  *   5. 16MB relay buffer high-water mark — keeps TCP pipeline saturated
+ *   6. Chunk re-queue on pump failure — no stalls if P2P/relay dies mid-batch
  *
  * All streams share one atomic chunk counter. Each stream independently
  * claims chunks and sends them. Receiver deduplicates and reassembles.
  */
 
-const CHUNK_SIZE = 256 * 1024;           // 256KB — matches Go relay buffer, 4x fewer frames
-const NUM_P2P = 4;                       // WebRTC P2P connections
-const NUM_RELAY = 8;                     // WebSocket relay connections (8 TCP streams)
-const BATCH_SIZE = 64;                   // Chunks per batch (16MB per batch with single disk read)
-const P2P_BUF_LOW = 512 * 1024;         // P2P resume threshold (512KB)
-const P2P_BUF_HIGH = 2 * 1024 * 1024;   // P2P pause threshold (2MB)
-const RELAY_BUF_HIGH = 16 * 1024 * 1024; // 16MB relay buffer — keep TCP pipeline saturated
+// CHUNK_PAYLOAD_SIZE is 65532 bytes so the full wire frame (header + payload)
+// is exactly 65536 bytes = the default WebRTC DataChannel max-message-size
+// (without SDP `max-message-size` negotiation). WebSocket has no such limit,
+// but using the same chunk size across both transports keeps the receiver
+// logic unified and the wire frame aligned to a power-of-2 boundary.
+const CHUNK_PAYLOAD_SIZE = 64 * 1024 - 4; // 65532 bytes of file data per chunk
+const CHUNK_SIZE = CHUNK_PAYLOAD_SIZE;    // Alias used by totalChunks calculation
+const NUM_P2P = 4;                        // WebRTC P2P connections
+const NUM_RELAY = 8;                      // WebSocket relay connections (8 TCP streams)
+const BATCH_SIZE = 256;                   // 256 × ~64KB ≈ 16MB per batch (one disk read)
+const P2P_BUF_LOW = 256 * 1024;           // P2P resume threshold
+const P2P_BUF_HIGH = 1 * 1024 * 1024;     // P2P pause threshold (1MB)
+const RELAY_BUF_HIGH = 16 * 1024 * 1024;  // 16MB relay buffer — keep TCP pipeline saturated
 
 /**
  * MessageChannel yield — bypasses setTimeout's 4ms minimum after 5 nested levels.
@@ -74,6 +82,7 @@ class TransferEngine {
     this._lastTime = 0;
     this._statsInterval = null;
     this._nextChunkIndex = 0;
+    this._retryIndices = [];  // Chunks un-sent by a failed pump — other pumps pick them up
     this._completeFired = false;
     this._sendingStarted = false;
   }
@@ -322,8 +331,8 @@ class TransferEngine {
    * RELAY PUMP — Maximum throughput with MessageChannel yield.
    *
    * Key insight: setTimeout(0) has a 4ms minimum after 5 nested levels in Chrome.
-   * At 256KB chunks, 4ms/yield = 64 MB/s ceiling per connection.
-   * MessageChannel yield = 0.1-0.5ms = 512-2560 MB/s ceiling per connection.
+   * At 64KB chunks, 4ms/yield = 16 MB/s ceiling per connection.
+   * MessageChannel yield = 0.1-0.5ms = 128-640 MB/s ceiling per connection.
    *
    * Combined with 16MB buffer high-water mark, this keeps TCP fully saturated.
    */
@@ -332,22 +341,35 @@ class TransferEngine {
     console.log('Relay pump started');
 
     try {
-      while (this._nextChunkIndex < this.totalChunks) {
+      while (this._moreWork()) {
         // Read a batch of chunks (single disk I/O)
         const batch = await this._readBatch();
         if (batch.length === 0) break;
 
         // Blast the batch into the WebSocket
         for (let i = 0; i < batch.length; i++) {
-          if (ws.readyState !== WebSocket.OPEN) return;
+          if (ws.readyState !== WebSocket.OPEN) {
+            // Return remaining chunks so another pump can send them
+            this._requeue(batch.slice(i).map(b => b.index));
+            return;
+          }
 
           // Backpressure: yield via MessageChannel when buffer is full
           while (ws.bufferedAmount > RELAY_BUF_HIGH) {
-            if (ws.readyState !== WebSocket.OPEN) return;
+            if (ws.readyState !== WebSocket.OPEN) {
+              this._requeue(batch.slice(i).map(b => b.index));
+              return;
+            }
             await yielder.yield();
           }
 
-          ws.send(batch[i].data);
+          try {
+            ws.send(batch[i].data);
+          } catch (e) {
+            console.warn('Relay send error:', e);
+            this._requeue(batch.slice(i).map(b => b.index));
+            return;
+          }
           this.sentChunks++;
           this.bytesTransferred += batch[i].size;
           this._checkDone();
@@ -360,16 +382,17 @@ class TransferEngine {
 
   /**
    * P2P PUMP — Tight loop with native onbufferedamountlow callback.
-   * No setTimeout/MessageChannel needed — browser handles backpressure natively.
+   * Unsent chunks on channel failure are re-queued for other pumps.
    */
   async _p2pPump(channel, idx) {
     console.log(`P2P-${idx} pump started`);
 
-    while (this._nextChunkIndex < this.totalChunks) {
+    while (this._moreWork()) {
       const batch = await this._readBatch();
       if (batch.length === 0) break;
 
       let bi = 0;
+      let failed = false;
       await new Promise((resolve) => {
         const blast = () => {
           while (bi < batch.length) {
@@ -378,8 +401,15 @@ class TransferEngine {
               channel.onbufferedamountlow = blast;
               return;
             }
-            try { channel.send(batch[bi].data); }
-            catch (e) { channel.onbufferedamountlow = blast; return; }
+            try {
+              channel.send(batch[bi].data);
+            } catch (e) {
+              console.warn(`P2P-${idx} send error (chunk ${batch[bi].index}):`, e.message || e);
+              failed = true;
+              channel.onbufferedamountlow = null;
+              resolve();
+              return;
+            }
             this.sentChunks++;
             this.bytesTransferred += batch[bi].size;
             bi++;
@@ -391,47 +421,87 @@ class TransferEngine {
         blast();
       });
 
-      if (channel.readyState !== 'open') return;
+      // Re-queue anything we didn't send (channel died, or send() threw)
+      if (bi < batch.length) {
+        this._requeue(batch.slice(bi).map(b => b.index));
+      }
+
+      // Permanently give up on a broken channel so we don't spin
+      if (failed || channel.readyState !== 'open') return;
     }
+  }
+
+  // Work-remaining helper — accounts for retry queue in addition to counter
+  _moreWork() {
+    return this._nextChunkIndex < this.totalChunks || this._retryIndices.length > 0;
+  }
+
+  _requeue(indices) {
+    if (!indices || indices.length === 0) return;
+    for (const idx of indices) this._retryIndices.push(idx);
   }
 
   /**
    * Read a batch of chunks with SINGLE disk I/O.
    *
-   * Previous: 64 separate file.slice().arrayBuffer() calls = 64 disk reads.
-   * Now: 1 large file.slice().arrayBuffer() + in-memory subdivision.
-   * At 256KB × 64 chunks = 16MB per batch, this is 64x fewer I/O operations.
+   * Priority:
+   *  1. Drain the retry queue (chunks released by failed pumps)
+   *  2. Claim new contiguous chunks from _nextChunkIndex
    *
-   * Thread-safe: _nextChunkIndex claim is synchronous (before any await),
+   * One large file.slice().arrayBuffer() per contiguous claim, plus per-chunk
+   * reads for scattered retries (rare path — only hit on pump failure).
+   *
+   * Thread-safe: counter/queue mutations are synchronous (before any await),
    * so concurrent async pumps never claim overlapping chunks.
    */
   async _readBatch() {
-    // Atomically claim a range of chunks (synchronous — no interleaving)
-    const startIdx = this._nextChunkIndex;
-    const count = Math.min(BATCH_SIZE, this.totalChunks - startIdx);
-    if (count <= 0) return [];
-    this._nextChunkIndex += count;
-
-    // Single disk read for the entire batch
-    const byteStart = startIdx * CHUNK_SIZE;
-    const byteEnd = Math.min((startIdx + count) * CHUNK_SIZE, this.file.size);
-    const bigBuf = await this.file.slice(byteStart, byteEnd).arrayBuffer();
-    const bigArr = new Uint8Array(bigBuf);
-
-    // Subdivide into chunks with 4-byte index header
-    const batch = [];
-    for (let i = 0; i < count; i++) {
-      const chunkIdx = startIdx + i;
-      const offset = i * CHUNK_SIZE;
-      const end = Math.min(offset + CHUNK_SIZE, bigBuf.byteLength);
-      const chunkLen = end - offset;
-
-      // [4-byte chunk index | chunk data]
-      const combined = new Uint8Array(4 + chunkLen);
-      new DataView(combined.buffer).setUint32(0, chunkIdx);
-      combined.set(bigArr.subarray(offset, end), 4);
-      batch.push({ data: combined.buffer, size: chunkLen });
+    // 1. Drain retry queue first (urgent — these chunks failed on another pump)
+    const retryIdx = [];
+    while (retryIdx.length < BATCH_SIZE && this._retryIndices.length > 0) {
+      retryIdx.push(this._retryIndices.shift());
     }
+
+    // 2. Claim new contiguous chunks
+    const remaining = BATCH_SIZE - retryIdx.length;
+    const startIdx = this._nextChunkIndex;
+    const count = Math.min(remaining, this.totalChunks - startIdx);
+    if (count > 0) this._nextChunkIndex += count;
+
+    if (retryIdx.length === 0 && count <= 0) return [];
+
+    const batch = [];
+
+    // Per-index read for retry chunks (slow path, only on failures)
+    for (const chunkIdx of retryIdx) {
+      const start = chunkIdx * CHUNK_PAYLOAD_SIZE;
+      const end = Math.min(start + CHUNK_PAYLOAD_SIZE, this.file.size);
+      const buf = await this.file.slice(start, end).arrayBuffer();
+      const combined = new Uint8Array(4 + buf.byteLength);
+      new DataView(combined.buffer).setUint32(0, chunkIdx);
+      combined.set(new Uint8Array(buf), 4);
+      batch.push({ data: combined.buffer, size: buf.byteLength, index: chunkIdx });
+    }
+
+    // Single large disk read for the contiguous new claim (fast path)
+    if (count > 0) {
+      const byteStart = startIdx * CHUNK_PAYLOAD_SIZE;
+      const byteEnd = Math.min((startIdx + count) * CHUNK_PAYLOAD_SIZE, this.file.size);
+      const bigBuf = await this.file.slice(byteStart, byteEnd).arrayBuffer();
+      const bigArr = new Uint8Array(bigBuf);
+
+      for (let i = 0; i < count; i++) {
+        const chunkIdx = startIdx + i;
+        const offset = i * CHUNK_PAYLOAD_SIZE;
+        const end = Math.min(offset + CHUNK_PAYLOAD_SIZE, bigBuf.byteLength);
+        const chunkLen = end - offset;
+
+        const combined = new Uint8Array(4 + chunkLen);
+        new DataView(combined.buffer).setUint32(0, chunkIdx);
+        combined.set(bigArr.subarray(offset, end), 4);
+        batch.push({ data: combined.buffer, size: chunkLen, index: chunkIdx });
+      }
+    }
+
     return batch;
   }
 
